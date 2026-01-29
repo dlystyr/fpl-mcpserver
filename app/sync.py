@@ -3,20 +3,29 @@
 import asyncio
 import logging
 import httpx
-from datetime import datetime
+from datetime import datetime, timezone
 from dateutil import parser as dateparser
 
 from config import get_settings
 
 
 def parse_datetime(value: str | None) -> datetime | None:
-    """Parse datetime string from FPL API to Python datetime object."""
+    """Parse datetime string from FPL API to Python datetime object (UTC)."""
     if not value:
         return None
     try:
-        return dateparser.parse(value)
+        dt = dateparser.parse(value)
+        # Convert to UTC if timezone-aware, otherwise assume UTC
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=timezone.utc)
     except (ValueError, TypeError):
         return None
+
+
+def utc_now() -> datetime:
+    """Return current UTC time as timezone-aware datetime."""
+    return datetime.now(timezone.utc)
 
 
 from database import init_db, close_db, get_pool
@@ -59,7 +68,7 @@ async def sync_teams(pool, teams: list) -> int:
                 t.get("strength"), t.get("strength_overall_home"),
                 t.get("strength_overall_away"), t.get("strength_attack_home"),
                 t.get("strength_attack_away"), t.get("strength_defence_home"),
-                t.get("strength_defence_away"), datetime.utcnow())
+                t.get("strength_defence_away"), utc_now())
     return len(teams)
 
 
@@ -87,7 +96,7 @@ async def sync_events(pool, events: list) -> int:
                 e.get("is_next", False), e.get("is_previous", False),
                 e.get("average_entry_score"), e.get("highest_score"),
                 e.get("most_selected"), e.get("most_captained"),
-                e.get("most_vice_captained"), datetime.utcnow())
+                e.get("most_vice_captained"), utc_now())
     return len(events)
 
 
@@ -150,7 +159,7 @@ async def sync_players(pool, players: list) -> int:
                 p.get("starts", 0), p.get("status", "a"),
                 p.get("chance_of_playing_next_round"),
                 p.get("chance_of_playing_this_round"),
-                p.get("news"), parse_datetime(p.get("news_added")), datetime.utcnow())
+                p.get("news"), parse_datetime(p.get("news_added")), utc_now())
     return len(players)
 
 
@@ -174,7 +183,7 @@ async def sync_fixtures(pool, fixtures: list) -> int:
                 f.get("team_h_score"), f.get("team_a_score"),
                 f.get("finished", False), parse_datetime(f.get("kickoff_time")),
                 f.get("team_h_difficulty"), f.get("team_a_difficulty"),
-                datetime.utcnow())
+                utc_now())
     return len(fixtures)
 
 
@@ -265,7 +274,7 @@ async def populate_redis(teams: list, players: list, fixtures: list, events: lis
     if current:
         await cache_set("fpl:current_gw", current["id"])
 
-    await cache_set("fpl:last_updated", datetime.utcnow().isoformat())
+    await cache_set("fpl:last_updated", utc_now().isoformat())
 
 
 async def main():
