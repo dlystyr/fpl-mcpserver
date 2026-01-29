@@ -10,22 +10,22 @@ from config import get_settings
 
 
 def parse_datetime(value: str | None) -> datetime | None:
-    """Parse datetime string from FPL API to Python datetime object (UTC)."""
+    """Parse datetime string from FPL API to naive UTC datetime."""
     if not value:
         return None
     try:
         dt = dateparser.parse(value)
-        # Convert to UTC if timezone-aware, otherwise assume UTC
+        # Convert to UTC and strip timezone info for PostgreSQL TIMESTAMP columns
         if dt.tzinfo is not None:
-            return dt.astimezone(timezone.utc)
-        return dt.replace(tzinfo=timezone.utc)
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
     except (ValueError, TypeError):
         return None
 
 
 def utc_now() -> datetime:
-    """Return current UTC time as timezone-aware datetime."""
-    return datetime.now(timezone.utc)
+    """Return current UTC time as naive datetime."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 from database import init_db, close_db, get_pool
