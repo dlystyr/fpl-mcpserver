@@ -18,6 +18,7 @@ async def init_cache() -> bool:
         _client = redis.Redis(
             host=settings.redis_host,
             port=settings.redis_port,
+            username=settings.redis_user,
             password=settings.redis_password,
             ssl=settings.redis_ssl,
             decode_responses=True,

@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     # Redis
     redis_host: str = Field(default="localhost", description="Redis host")
     redis_port: int = Field(default=6379, description="Redis port")
+    redis_user: str | None = Field(default=None, description="Redis username (for ACL/Redis 6+)")
     redis_password: str | None = Field(default=None, description="Redis password")
     redis_ssl: bool = Field(default=False, description="Use SSL for Redis connection")
 
@@ -42,7 +43,12 @@ class Settings(BaseSettings):
     def redis_url(self) -> str:
         """Construct Redis URL from components."""
         scheme = "rediss" if self.redis_ssl else "redis"
-        auth = f":{self.redis_password}@" if self.redis_password else ""
+        if self.redis_user and self.redis_password:
+            auth = f"{self.redis_user}:{self.redis_password}@"
+        elif self.redis_password:
+            auth = f":{self.redis_password}@"
+        else:
+            auth = ""
         return f"{scheme}://{auth}{self.redis_host}:{self.redis_port}/0"
 
     @computed_field

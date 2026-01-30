@@ -78,6 +78,7 @@ services:
       # Redis: Use external settings if REDIS_HOST is set, otherwise default to local
       - REDIS_HOST=${REDIS_HOST:-redis}
       - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_USER=${REDIS_USER:-}
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - REDIS_SSL=${REDIS_SSL:-false}
       # Auth
@@ -120,6 +121,7 @@ services:
       # Redis: Use external settings if REDIS_HOST is set, otherwise default to local
       - REDIS_HOST=${REDIS_HOST:-redis}
       - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_USER=${REDIS_USER:-}
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
       - REDIS_SSL=${REDIS_SSL:-false}
       # Logging
