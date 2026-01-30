@@ -44,7 +44,11 @@ async def cache_get(key: str):
     if not _client:
         return None
     try:
-        return await _client.json().get(key, ROOT)
+        result = await _client.json().get(key, ROOT)
+        # RedisJSON with "$" path returns results wrapped in a list
+        if isinstance(result, list) and len(result) == 1:
+            return result[0]
+        return result
     except Exception:
         return None
 
