@@ -23,7 +23,9 @@ async def init_cache() -> bool:
             decode_responses=True,
         )
         await _client.ping()
-        logger.info(f"Connected to Redis at {settings.redis_host}:{settings.redis_port}")
+        mode = "external" if settings.is_external_redis else "local"
+        ssl_status = " (SSL)" if settings.redis_ssl else ""
+        logger.info(f"Connected to Redis ({mode}) at {settings.redis_host}:{settings.redis_port}{ssl_status}")
         return True
     except Exception as e:
         logger.warning(f"Redis connection failed: {e}")

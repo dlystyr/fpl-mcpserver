@@ -1,0 +1,36 @@
+# FPL MCP Server Dockerfile
+# Build: docker build -f Dockerfile.mcp -t fpl-mcp:latest .
+# Run: docker run -p 8000:8000 --env-file .env fpl-mcp:latest
+
+FROM python:3.12-slim
+
+LABEL org.opencontainers.image.title="FPL MCP Server"
+LABEL org.opencontainers.image.description="Model Context Protocol server for Fantasy Premier League analytics"
+LABEL org.opencontainers.image.source="https://github.com/your-org/fpl-mcp"
+
+WORKDIR /app
+
+# Install curl for healthcheck
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install dependencies
+COPY app/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY app/ .
+
+# Create non-root user for security
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Default command - run MCP server
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

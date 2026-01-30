@@ -28,6 +28,27 @@ BEARER_TOKEN = os.getenv("MCP_BEARER_TOKEN", "")
 
 Position = Literal["GKP", "DEF", "MID", "FWD"]
 POS_MAP: dict[int, Position] = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
+
+# FPL Rules Constants
+SQUAD_SIZE = 15
+SQUAD_COMPOSITION: dict[Position, int] = {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}
+MAX_PLAYERS_PER_TEAM = 3
+STARTING_BUDGET = 100.0  # £100m
+
+# Expected points coefficients (based on historical FPL scoring)
+# Goals: GKP=6, DEF=6, MID=5, FWD=4
+# Assists: 3 for all
+# Clean sheets: GKP=4, DEF=4, MID=1, FWD=0
+# Minutes: 1pt for 1-59min, 2pt for 60+
+# Saves: 1pt per 3 saves (GKP only)
+# Bonus: avg ~1.5 for top performers
+XPT_COEFFS = {
+    "GKP": {"goal": 6, "assist": 3, "cs": 4, "saves_per_pt": 3},
+    "DEF": {"goal": 6, "assist": 3, "cs": 4},
+    "MID": {"goal": 5, "assist": 3, "cs": 1},
+    "FWD": {"goal": 4, "assist": 3, "cs": 0},
+}
+
 DEFAULT_PLAYER_FIELDS = [
     "id",
     "first_name",
@@ -177,6 +198,297 @@ def _availability_penalty(el: dict[str, Any]) -> float:
         if c < 50:
             penalty += 2.0
     return penalty
+
+
+def _playing_probability(el: dict[str, Any], avg_minutes: float = 90.0) -> float:
+    """
+    Estimate probability of playing 60+ minutes based on status, news, and recent minutes.
+    Returns 0.0 to 1.0.
+    """
+    status = str(el.get("status", "a"))
+    chance = el.get("chance_of_playing_next_round")
+
+    # Base probability from status
+    if status == "a":
+        base = 1.0
+    elif status == "d":  # Doubtful
+        base = 0.5
+    elif status == "i":  # Injured
+        base = 0.0
+    elif status == "s":  # Suspended
+        base = 0.0
+    elif status == "u":  # Unavailable
+        base = 0.0
+    else:
+        base = 0.75
+
+    # Override with explicit chance if available
+    if chance is not None:
+        base = min(base, _to_float(chance, 100.0) / 100.0)
+
+    # Adjust for minutes trend (rotation risk)
+    if avg_minutes < 45:
+        base *= 0.5
+    elif avg_minutes < 60:
+        base *= 0.7
+    elif avg_minutes < 75:
+        base *= 0.85
+
+    return min(1.0, max(0.0, base))
+
+
+def _calculate_expected_points(
+    el: dict[str, Any],
+    fixture_difficulty: float,
+    is_home: bool,
+    playing_prob: float,
+    avg_minutes: float,
+) -> dict[str, Any]:
+    """
+    Calculate expected points for a single gameweek using xG/xA and fixture context.
+
+    Returns breakdown of expected points by category.
+    """
+    pos = POS_MAP.get(int(el.get("element_type", 3)), "MID")
+    coeffs = XPT_COEFFS.get(pos, XPT_COEFFS["MID"])
+
+    minutes = int(_to_float(el.get("minutes")))
+    games_played = max(1, minutes / 90.0)
+
+    # Per-game xG and xA from season totals
+    xg_season = _to_float(el.get("expected_goals"))
+    xa_season = _to_float(el.get("expected_assists"))
+    xg_per_game = xg_season / games_played if games_played > 0 else 0.0
+    xa_per_game = xa_season / games_played if games_played > 0 else 0.0
+
+    # Adjust for fixture difficulty (1=easy, 5=hard)
+    # Easy fixtures boost attacking output, hard fixtures reduce it
+    difficulty_factor = 1.0 + (3.0 - fixture_difficulty) * 0.1  # Range: 0.8 to 1.2
+    home_boost = 1.1 if is_home else 1.0
+
+    xg_adj = xg_per_game * difficulty_factor * home_boost
+    xa_adj = xa_per_game * difficulty_factor * home_boost
+
+    # Expected points from goals and assists
+    xpts_goals = xg_adj * coeffs["goal"]
+    xpts_assists = xa_adj * coeffs["assist"]
+
+    # Clean sheet probability (for defenders/GKPs)
+    # Base CS rate adjusted by opponent's xG
+    cs_prob = 0.0
+    if pos in ("GKP", "DEF"):
+        # Rough estimate: easier fixtures = higher CS probability
+        base_cs_rate = 0.35  # ~35% of games result in CS on average
+        cs_prob = base_cs_rate * (1.0 + (3.0 - fixture_difficulty) * 0.15)
+        cs_prob = min(0.6, max(0.1, cs_prob))  # Cap between 10-60%
+    xpts_cs = cs_prob * coeffs.get("cs", 0)
+
+    # Minutes points (2 for 60+, 1 for 1-59)
+    prob_60_plus = playing_prob * min(avg_minutes / 90.0, 1.0)
+    prob_1_to_59 = playing_prob * (1.0 - prob_60_plus / playing_prob) if playing_prob > 0 else 0.0
+    xpts_minutes = (prob_60_plus * 2.0) + (prob_1_to_59 * 1.0)
+
+    # Bonus points estimate (based on ICT index ranking)
+    ict = _to_float(el.get("ict_index"))
+    ict_per_game = ict / games_played if games_played > 0 else 0.0
+    # Top ICT performers (~10+) get avg 1.5 bonus, mid-range (~5) get ~0.5
+    xpts_bonus = min(2.0, max(0.0, (ict_per_game - 3.0) * 0.2))
+
+    # GKP saves (rough estimate)
+    xpts_saves = 0.0
+    if pos == "GKP":
+        # Assume ~3 saves per game on average
+        saves_per_game = 3.0 * (1.0 + (fixture_difficulty - 3.0) * 0.1)
+        xpts_saves = saves_per_game / coeffs.get("saves_per_pt", 3)
+
+    total_xpts = (xpts_goals + xpts_assists + xpts_cs + xpts_minutes + xpts_bonus + xpts_saves) * playing_prob
+
+    return {
+        "expected_points": round(total_xpts, 2),
+        "breakdown": {
+            "xpts_goals": round(xpts_goals * playing_prob, 3),
+            "xpts_assists": round(xpts_assists * playing_prob, 3),
+            "xpts_clean_sheet": round(xpts_cs * playing_prob, 3),
+            "xpts_minutes": round(xpts_minutes, 3),
+            "xpts_bonus": round(xpts_bonus * playing_prob, 3),
+            "xpts_saves": round(xpts_saves * playing_prob, 3),
+        },
+        "adjustments": {
+            "playing_probability": round(playing_prob, 3),
+            "fixture_difficulty": fixture_difficulty,
+            "difficulty_factor": round(difficulty_factor, 3),
+            "is_home": is_home,
+            "xg_per_game": round(xg_per_game, 3),
+            "xa_per_game": round(xa_per_game, 3),
+        },
+    }
+
+
+def _calculate_multi_gw_xpts(
+    el: dict[str, Any],
+    fixtures: list[dict[str, Any]],
+    teams_by_id: dict[int, dict[str, Any]],
+    current_event: int | None,
+    horizon_gws: int,
+    avg_minutes: float = 90.0,
+) -> dict[str, Any]:
+    """
+    Calculate expected points over multiple gameweeks.
+    """
+    team_id = int(el["team"])
+    playing_prob = _playing_probability(el, avg_minutes)
+
+    gw_xpts: list[dict[str, Any]] = []
+    total_xpts = 0.0
+
+    if current_event is not None:
+        for fx in fixtures:
+            ev = fx.get("event")
+            if ev is None:
+                continue
+            ev = int(ev)
+            if ev < current_event or ev >= current_event + horizon_gws:
+                continue
+
+            # Check if this fixture involves our team
+            if fx.get("team_h") == team_id:
+                difficulty = int(_to_float(fx.get("team_h_difficulty"), 3))
+                is_home = True
+                opp_id = fx.get("team_a")
+            elif fx.get("team_a") == team_id:
+                difficulty = int(_to_float(fx.get("team_a_difficulty"), 3))
+                is_home = False
+                opp_id = fx.get("team_h")
+            else:
+                continue
+
+            gw_calc = _calculate_expected_points(el, difficulty, is_home, playing_prob, avg_minutes)
+            gw_xpts.append({
+                "event": ev,
+                "opponent": teams_by_id.get(int(opp_id), {}).get("name") if opp_id else None,
+                "is_home": is_home,
+                "difficulty": difficulty,
+                "expected_points": gw_calc["expected_points"],
+            })
+            total_xpts += gw_calc["expected_points"]
+
+    return {
+        "total_expected_points": round(total_xpts, 2),
+        "gameweeks": gw_xpts,
+        "avg_xpts_per_gw": round(total_xpts / len(gw_xpts), 2) if gw_xpts else 0.0,
+        "playing_probability": round(playing_prob, 3),
+    }
+
+
+def _validate_squad(
+    squad_ids: list[int],
+    elements_by_id: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Validate a squad against FPL rules.
+
+    Returns validation result with any violations.
+    """
+    violations: list[str] = []
+    warnings: list[str] = []
+
+    # Count positions
+    pos_counts: dict[str, int] = {"GKP": 0, "DEF": 0, "MID": 0, "FWD": 0}
+    team_counts: dict[int, int] = {}
+    total_value = 0.0
+
+    for pid in squad_ids:
+        el = elements_by_id.get(pid)
+        if el is None:
+            violations.append(f"Unknown player ID: {pid}")
+            continue
+
+        pos = POS_MAP.get(int(el.get("element_type", 3)), "MID")
+        team_id = int(el.get("team", 0))
+        price = _price_m(int(el.get("now_cost", 0)))
+
+        pos_counts[pos] = pos_counts.get(pos, 0) + 1
+        team_counts[team_id] = team_counts.get(team_id, 0) + 1
+        total_value += price
+
+    # Check squad size
+    if len(squad_ids) != SQUAD_SIZE:
+        violations.append(f"Squad size is {len(squad_ids)}, must be {SQUAD_SIZE}")
+
+    # Check position limits
+    for pos, required in SQUAD_COMPOSITION.items():
+        actual = pos_counts.get(pos, 0)
+        if actual != required:
+            violations.append(f"{pos}: have {actual}, need exactly {required}")
+
+    # Check team limits
+    for team_id, count in team_counts.items():
+        if count > MAX_PLAYERS_PER_TEAM:
+            violations.append(f"Team {team_id}: have {count} players, max is {MAX_PLAYERS_PER_TEAM}")
+
+    return {
+        "valid": len(violations) == 0,
+        "violations": violations,
+        "warnings": warnings,
+        "position_counts": pos_counts,
+        "team_counts": team_counts,
+        "total_value_m": round(total_value, 1),
+    }
+
+
+def _can_transfer_in(
+    player_in: dict[str, Any],
+    player_out: dict[str, Any],
+    current_squad_ids: set[int],
+    elements_by_id: dict[int, dict[str, Any]],
+    bank: float,
+    selling_price: float | None = None,
+) -> dict[str, Any]:
+    """
+    Check if a transfer is valid according to FPL rules.
+
+    Returns dict with 'valid' bool and 'reasons' list if invalid.
+    """
+    reasons: list[str] = []
+
+    pid_in = int(player_in["id"])
+    pid_out = int(player_out["id"])
+    pos_in = POS_MAP.get(int(player_in.get("element_type", 3)), "MID")
+    pos_out = POS_MAP.get(int(player_out.get("element_type", 3)), "MID")
+    team_in = int(player_in.get("team", 0))
+
+    # Must be same position
+    if pos_in != pos_out:
+        reasons.append(f"Position mismatch: {pos_out} → {pos_in}")
+
+    # Check if player already in squad
+    if pid_in in current_squad_ids:
+        reasons.append(f"Player {pid_in} already in squad")
+
+    # Check team limit (count current team members excluding player out)
+    team_count = sum(
+        1 for pid in current_squad_ids
+        if pid != pid_out and int(elements_by_id.get(pid, {}).get("team", 0)) == team_in
+    )
+    if team_count >= MAX_PLAYERS_PER_TEAM:
+        reasons.append(f"Already have {MAX_PLAYERS_PER_TEAM} players from team {team_in}")
+
+    # Check budget
+    price_in = _price_m(int(player_in.get("now_cost", 0)))
+    if selling_price is None:
+        selling_price = _price_m(int(player_out.get("now_cost", 0)))
+
+    available = bank + selling_price
+    if price_in > available:
+        reasons.append(f"Cannot afford: need £{price_in}m, have £{round(available, 1)}m")
+
+    return {
+        "valid": len(reasons) == 0,
+        "reasons": reasons,
+        "price_in": price_in,
+        "selling_price": selling_price,
+        "bank_after": round(available - price_in, 1) if len(reasons) == 0 else None,
+    }
 
 
 def _player_identity(el: dict[str, Any], teams_by_id: dict[int, dict[str, Any]]) -> dict[str, Any]:
@@ -451,10 +763,12 @@ def _score_player_first_pass(
     fixtures: list[dict[str, Any]],
     horizon_gws: int,
     current_event: int | None,
+    avg_minutes: float | None = None,
 ) -> dict[str, Any]:
     """
-    Fast scoring using bootstrap + fixtures only.
-    Used to select a candidate pool for second-pass refinement.
+    Score player using expected points model.
+
+    Uses xG/xA-based projections adjusted for fixture difficulty.
     """
     team_id = int(el["team"])
     pos = POS_MAP.get(int(el["element_type"]), "MID")
@@ -464,53 +778,65 @@ def _score_player_first_pass(
     form = _to_float(el.get("form"))
     ict = _to_float(el.get("ict_index"))
     minutes = int(_to_float(el.get("minutes")))
+    games_played = max(1, minutes / 90.0)
 
-    diffs: list[int] = []
-    if current_event is not None:
-        for fx in fixtures:
-            ev = fx.get("event")
-            if ev is None:
-                continue
-            ev = int(ev)
-            if ev < current_event or ev >= current_event + max(1, horizon_gws):
-                continue
-            d = _fixture_difficulty_for_team(fx, team_id)
-            if d is not None:
-                diffs.append(d)
+    # Calculate average minutes per game for playing probability
+    if avg_minutes is None:
+        avg_minutes = minutes / games_played if games_played > 1 else 90.0
 
-    fixture_ease = (6.0 - (sum(diffs) / len(diffs))) if diffs else 0.0
-    value = (ppg / price) if price else 0.0
+    # Get multi-gameweek expected points
+    xpts_data = _calculate_multi_gw_xpts(
+        el, fixtures, teams_by_id, current_event, horizon_gws, avg_minutes
+    )
+
+    total_xpts = xpts_data["total_expected_points"]
+    playing_prob = xpts_data["playing_probability"]
+
+    # Value metric: expected points per million spent over horizon
+    value = (total_xpts / price) if price else 0.0
+
+    # Availability penalty for flagged players
     penalty = _availability_penalty(el)
 
-    score = (
-        (ppg * 2.0)
-        + (form * 1.2)
-        + (ict * 0.10)
-        + (value * 3.0)
-        + (fixture_ease * 1.0)
-        + (min(minutes / 900.0, 1.0) * 1.0)
-        - penalty
-    )
+    # Final score is expected points with minor adjustments
+    # We prioritize xPts but give small boosts for:
+    # - Recent form (shows current performance level)
+    # - Value (points per million is important for budget)
+    score = total_xpts + (form * 0.3) + (value * 0.5) - penalty
 
     team_name = teams_by_id.get(team_id, {}).get("name", str(team_id))
     name = f"{el.get('first_name','')} {el.get('second_name','')}".strip() or str(el.get("web_name"))
+
+    # xG and xA stats
+    xg = _to_float(el.get("expected_goals"))
+    xa = _to_float(el.get("expected_assists"))
+    xgi = _to_float(el.get("expected_goal_involvements"))
 
     return {
         "id": int(el["id"]),
         "name": name,
         "team": team_name,
+        "team_id": team_id,
         "position": pos,
         "price_m": round(price, 1),
+        "expected_points": round(total_xpts, 2),
         "base_score": round(score, 3),
         "signals": {
             "points_per_game": ppg,
             "form": form,
             "ict_index": ict,
-            "value_ppg_per_million": round(value, 3),
-            "fixture_ease_next_horizon": round(fixture_ease, 3),
+            "xg_season": round(xg, 2),
+            "xa_season": round(xa, 2),
+            "xgi_season": round(xgi, 2),
+            "xg_per_game": round(xg / games_played, 3) if games_played > 0 else 0.0,
+            "xa_per_game": round(xa / games_played, 3) if games_played > 0 else 0.0,
+            "value_xpts_per_million": round(value, 3),
+            "playing_probability": playing_prob,
             "availability_penalty": penalty,
             "minutes_season": minutes,
+            "avg_minutes_per_game": round(avg_minutes, 1),
         },
+        "fixture_xpts": xpts_data["gameweeks"],
     }
 
 
@@ -758,7 +1084,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="fpl_transfer_suggestions",
-        description="Suggest transfers for a manager's team based on form, fixtures, and value.",
+        description="Suggest transfers respecting ALL FPL rules: same position, max 3 per team, budget. Uses xG/xA expected points model.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -768,10 +1094,26 @@ TOOLS: list[Tool] = [
                     "items": {"type": "string"},
                     "description": "Positions to consider (GKP/DEF/MID/FWD). Defaults to all.",
                 },
-                "max_transfers": {"type": "integer", "default": 3, "description": "Max transfer suggestions"},
-                "horizon_gws": {"type": "integer", "default": 5, "description": "Fixture horizon for scoring"},
+                "max_transfers": {"type": "integer", "default": 5, "description": "Max transfer suggestions to return"},
+                "horizon_gws": {"type": "integer", "default": 5, "description": "Fixture horizon for expected points"},
             },
             "required": ["manager_id"],
+        },
+    ),
+    Tool(
+        name="fpl_validate_squad",
+        description="Validate a squad against FPL rules: 15 players, position limits (2 GKP, 5 DEF, 5 MID, 3 FWD), max 3 per team.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "manager_id": {"type": "integer", "description": "FPL manager ID to validate their current squad"},
+                "player_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Alternative: provide player IDs directly instead of manager_id",
+                },
+            },
+            "required": [],
         },
     ),
     Tool(
@@ -1181,7 +1523,8 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         bs = await _bootstrap()
         teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
-        elements_by_id = {int(el["id"]): el for el in bs.get("elements", [])}
+        elements = bs.get("elements", [])
+        elements_by_id = {int(el["id"]): el for el in elements}
         events = bs.get("events", [])
         current_event = _current_event_id(events)
 
@@ -1202,16 +1545,48 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         fixtures = await _fixtures()
         team_outlook = _team_fixture_outlook(fixtures, teams_by_id, current_event, horizon_gws=fixture_horizon)
 
+        # Get squad IDs and validate
+        squad_ids = [int(p["element"]) for p in picks.get("picks", [])]
+        squad_validation = _validate_squad(squad_ids, elements_by_id)
+
+        # Count players per team for constraint display
+        team_player_count: dict[int, int] = {}
+        for pid in squad_ids:
+            el = elements_by_id.get(pid, {})
+            team_id = int(el.get("team", 0))
+            team_player_count[team_id] = team_player_count.get(team_id, 0) + 1
+
         squad = []
+        total_expected_points = 0.0
+
         for pick in picks.get("picks", []):
             el_id = int(pick["element"])
             el = elements_by_id.get(el_id, {})
             team_id = int(el.get("team", 0))
             team_fixtures = team_outlook.get(team_id, {}).get("next_opponents", [])[:fixture_horizon]
+
+            # Calculate expected points for this player
+            minutes = int(_to_float(el.get("minutes")))
+            games_played = max(1, minutes / 90.0)
+            avg_minutes = minutes / games_played if games_played > 1 else 90.0
+
+            xpts_data = _calculate_multi_gw_xpts(
+                el, fixtures, teams_by_id, current_event, fixture_horizon, avg_minutes
+            )
+
+            expected_pts = xpts_data["total_expected_points"]
+            total_expected_points += expected_pts
+
+            # xG/xA stats
+            xg = _to_float(el.get("expected_goals"))
+            xa = _to_float(el.get("expected_assists"))
+            xgi = _to_float(el.get("expected_goal_involvements"))
+
             squad.append({
                 "id": el_id,
                 "name": el.get("web_name", str(el_id)),
                 "team": teams_by_id.get(team_id, {}).get("name", str(team_id)),
+                "team_id": team_id,
                 "position": POS_MAP.get(int(el.get("element_type", 3)), "MID"),
                 "price_m": round(_price_m(int(el.get("now_cost", 0))), 1),
                 "is_captain": pick.get("is_captain", False),
@@ -1223,13 +1598,36 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "selected_by_percent": _to_float(el.get("selected_by_percent")),
                 "status": el.get("status"),
                 "chance_of_playing": el.get("chance_of_playing_next_round"),
+                "playing_probability": xpts_data["playing_probability"],
+                # xG/xA based metrics
+                "xg_season": round(xg, 2),
+                "xa_season": round(xa, 2),
+                "xgi_season": round(xgi, 2),
+                "xg_per_game": round(xg / games_played, 3) if games_played > 0 else 0.0,
+                "xa_per_game": round(xa / games_played, 3) if games_played > 0 else 0.0,
+                # Expected points over horizon
+                "expected_points": expected_pts,
+                "fixture_xpts": xpts_data["gameweeks"],
                 "upcoming_fixtures": team_fixtures,
             })
+
+        # Sort squad by position for display
+        pos_order = {"GKP": 0, "DEF": 1, "MID": 2, "FWD": 3}
+        squad.sort(key=lambda x: (pos_order.get(x["position"], 4), -x["expected_points"]))
 
         current_history = manager_hist.get("current", [])
         recent_gws = current_history[-5:] if current_history else []
 
         recent_transfers = transfers[-10:] if isinstance(transfers, list) else []
+
+        # Team counts with names
+        team_counts_display = {
+            teams_by_id.get(tid, {}).get("name", str(tid)): {
+                "count": count,
+                "at_limit": count >= MAX_PLAYERS_PER_TEAM,
+            }
+            for tid, count in team_player_count.items()
+        }
 
         payload = {
             "manager": {
@@ -1245,6 +1643,20 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             },
             "event_id": event_id,
             "active_chip": picks.get("active_chip"),
+            "squad_analysis": {
+                "total_expected_points": round(total_expected_points, 2),
+                "avg_expected_per_player": round(total_expected_points / len(squad), 2) if squad else 0.0,
+                "fixture_horizon": fixture_horizon,
+                "squad_valid": squad_validation["valid"],
+                "violations": squad_validation["violations"],
+                "position_counts": squad_validation["position_counts"],
+                "team_counts": team_counts_display,
+                "total_value_m": squad_validation["total_value_m"],
+            },
+            "fpl_rules": {
+                "max_per_team": MAX_PLAYERS_PER_TEAM,
+                "squad_composition": SQUAD_COMPOSITION,
+            },
             "squad": squad,
             "recent_gameweeks": recent_gws,
             "recent_transfers": recent_transfers,
@@ -1268,69 +1680,205 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps({"error": "No current event found"}))]
 
         try:
+            manager_info = await _manager_info(manager_id)
             picks = await _manager_picks(manager_id, current_event)
         except httpx.HTTPStatusError as e:
             return [TextContent(type="text", text=json.dumps({"error": f"Manager not found: {e.response.status_code}"}))]
 
         fixtures = await _fixtures()
 
-        current_squad_ids = {int(p["element"]) for p in picks.get("picks", [])}
+        # Get bank value
+        bank = _price_m(int(manager_info.get("last_deadline_bank", 0)))
+
+        current_squad_ids = set(int(p["element"]) for p in picks.get("picks", []))
+
+        # Validate current squad
+        squad_validation = _validate_squad(list(current_squad_ids), elements_by_id)
 
         pos_filters: set[str] = set()
         if positions_arg:
             pos_filters = {str(p).strip().upper() for p in positions_arg}
 
-        squad_by_pos: dict[str, list[dict[str, Any]]] = {"GKP": [], "DEF": [], "MID": [], "FWD": []}
+        # Score all current squad players
+        squad_scored: list[dict[str, Any]] = []
         for pid in current_squad_ids:
             el = elements_by_id.get(pid, {})
-            pos = POS_MAP.get(int(el.get("element_type", 3)), "MID")
             scored = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws, current_event)
-            squad_by_pos[pos].append(scored)
+            squad_scored.append(scored)
 
-        for pos_list in squad_by_pos.values():
-            pos_list.sort(key=lambda x: x["base_score"])
+        # Sort by expected points (ascending) to find weakest players
+        squad_scored.sort(key=lambda x: x["expected_points"])
 
         suggestions = []
-        for pos in ["GKP", "DEF", "MID", "FWD"]:
+        seen_transfers: set[tuple[int, int]] = set()  # (out_id, in_id)
+
+        # For each player in squad (starting from weakest), find valid upgrades
+        for player_out in squad_scored:
+            pos = player_out["position"]
             if pos_filters and pos not in pos_filters:
                 continue
-            if not squad_by_pos[pos]:
-                continue
 
-            weakest = squad_by_pos[pos][0]
-            weakest_price = weakest["price_m"]
+            out_id = player_out["id"]
+            out_el = elements_by_id.get(out_id, {})
+            selling_price = player_out["price_m"]
 
-            candidates = []
+            # Find candidates for this position
             for el in elements:
-                if int(el["id"]) in current_squad_ids:
+                in_id = int(el["id"])
+
+                # Skip if already in squad or same player
+                if in_id in current_squad_ids:
                     continue
-                el_pos = POS_MAP.get(int(el["element_type"]), "MID")
-                if el_pos != pos:
+
+                # Must be same position
+                in_pos = POS_MAP.get(int(el.get("element_type", 3)), "MID")
+                if in_pos != pos:
                     continue
+
+                # Skip unavailable players
                 if str(el.get("status", "a")) != "a":
                     continue
-                price = _price_m(int(el["now_cost"]))
-                if price > weakest_price + 2.0:
+
+                # Check all FPL constraints
+                transfer_check = _can_transfer_in(
+                    player_in=el,
+                    player_out=out_el,
+                    current_squad_ids=current_squad_ids,
+                    elements_by_id=elements_by_id,
+                    bank=bank,
+                    selling_price=selling_price,
+                )
+
+                if not transfer_check["valid"]:
                     continue
 
-                scored = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws, current_event)
-                if scored["base_score"] > weakest["base_score"]:
-                    candidates.append({
-                        "out": weakest,
-                        "in": scored,
-                        "score_gain": round(scored["base_score"] - weakest["base_score"], 3),
-                        "cost_diff": round(price - weakest_price, 1),
-                    })
+                # Skip if we've already suggested this transfer pair
+                if (out_id, in_id) in seen_transfers:
+                    continue
 
-            candidates.sort(key=lambda x: x["score_gain"], reverse=True)
-            suggestions.extend(candidates[:max_transfers])
+                # Score the incoming player
+                scored_in = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws, current_event)
 
-        suggestions.sort(key=lambda x: x["score_gain"], reverse=True)
+                # Calculate improvement
+                xpts_gain = scored_in["expected_points"] - player_out["expected_points"]
+
+                # Only suggest if it's actually an improvement
+                if xpts_gain <= 0:
+                    continue
+
+                seen_transfers.add((out_id, in_id))
+                suggestions.append({
+                    "out": {
+                        "id": out_id,
+                        "name": player_out["name"],
+                        "team": player_out["team"],
+                        "position": pos,
+                        "price_m": selling_price,
+                        "expected_points": player_out["expected_points"],
+                    },
+                    "in": {
+                        "id": in_id,
+                        "name": scored_in["name"],
+                        "team": scored_in["team"],
+                        "position": in_pos,
+                        "price_m": scored_in["price_m"],
+                        "expected_points": scored_in["expected_points"],
+                        "form": scored_in["signals"]["form"],
+                        "xg_per_game": scored_in["signals"]["xg_per_game"],
+                        "xa_per_game": scored_in["signals"]["xa_per_game"],
+                    },
+                    "xpts_gain": round(xpts_gain, 2),
+                    "cost_diff": round(scored_in["price_m"] - selling_price, 1),
+                    "bank_after": transfer_check["bank_after"],
+                    "constraints_check": {
+                        "valid": True,
+                        "same_position": True,
+                        "within_budget": True,
+                        "team_limit_ok": True,
+                    },
+                })
+
+        # Sort by expected points gain
+        suggestions.sort(key=lambda x: x["xpts_gain"], reverse=True)
 
         payload = {
             "manager_id": manager_id,
             "current_event": current_event,
+            "bank": bank,
+            "squad_validation": squad_validation,
+            "fpl_rules": {
+                "max_per_team": MAX_PLAYERS_PER_TEAM,
+                "squad_composition": SQUAD_COMPOSITION,
+            },
             "suggestions": suggestions[:max_transfers],
+            "note": "All suggestions respect FPL rules: same position, max 3 per team, and budget constraints.",
+        }
+        return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+    if name == "fpl_validate_squad":
+        manager_id = arguments.get("manager_id")
+        player_ids_arg = arguments.get("player_ids")
+
+        bs = await _bootstrap()
+        teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
+        elements = bs.get("elements", [])
+        elements_by_id = {int(el["id"]): el for el in elements}
+        events = bs.get("events", [])
+        current_event = _current_event_id(events)
+
+        squad_ids: list[int] = []
+
+        if manager_id is not None:
+            if current_event is None:
+                return [TextContent(type="text", text=json.dumps({"error": "No current event found"}))]
+            try:
+                picks = await _manager_picks(int(manager_id), current_event)
+                squad_ids = [int(p["element"]) for p in picks.get("picks", [])]
+            except httpx.HTTPStatusError as e:
+                return [TextContent(type="text", text=json.dumps({"error": f"Manager not found: {e.response.status_code}"}))]
+        elif player_ids_arg:
+            squad_ids = [int(pid) for pid in player_ids_arg]
+        else:
+            return [TextContent(type="text", text=json.dumps({"error": "Provide manager_id or player_ids"}))]
+
+        validation = _validate_squad(squad_ids, elements_by_id)
+
+        # Add detailed player breakdown
+        squad_details: list[dict[str, Any]] = []
+        for pid in squad_ids:
+            el = elements_by_id.get(pid, {})
+            team_id = int(el.get("team", 0))
+            squad_details.append({
+                "id": pid,
+                "name": el.get("web_name", str(pid)),
+                "team": teams_by_id.get(team_id, {}).get("name", str(team_id)),
+                "team_id": team_id,
+                "position": POS_MAP.get(int(el.get("element_type", 3)), "MID"),
+                "price_m": round(_price_m(int(el.get("now_cost", 0))), 1),
+            })
+
+        # Add team names to team_counts
+        team_counts_named = {
+            teams_by_id.get(tid, {}).get("name", str(tid)): count
+            for tid, count in validation["team_counts"].items()
+        }
+
+        payload = {
+            "valid": validation["valid"],
+            "violations": validation["violations"],
+            "warnings": validation["warnings"],
+            "fpl_rules": {
+                "squad_size": SQUAD_SIZE,
+                "squad_composition": SQUAD_COMPOSITION,
+                "max_per_team": MAX_PLAYERS_PER_TEAM,
+            },
+            "squad_summary": {
+                "total_players": len(squad_ids),
+                "total_value_m": validation["total_value_m"],
+                "position_counts": validation["position_counts"],
+                "team_counts": team_counts_named,
+            },
+            "squad_details": squad_details,
         }
         return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
 
