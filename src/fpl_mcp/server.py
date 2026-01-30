@@ -119,6 +119,22 @@ async def _event_live(event_id: int) -> dict[str, Any]:
     return await _get_json(f"event/{event_id}/live/", ttl=TTL_EVENT_LIVE)
 
 
+async def _manager_info(manager_id: int) -> dict[str, Any]:
+    return await _get_json(f"entry/{manager_id}/", ttl=TTL_BOOTSTRAP)
+
+
+async def _manager_history(manager_id: int) -> dict[str, Any]:
+    return await _get_json(f"entry/{manager_id}/history/", ttl=TTL_BOOTSTRAP)
+
+
+async def _manager_picks(manager_id: int, event_id: int) -> dict[str, Any]:
+    return await _get_json(f"entry/{manager_id}/event/{event_id}/picks/", ttl=TTL_EVENT)
+
+
+async def _manager_transfers(manager_id: int) -> dict[str, Any]:
+    return await _get_json(f"entry/{manager_id}/transfers/", ttl=TTL_BOOTSTRAP)
+
+
 def _price_m(now_cost: int) -> float:
     return now_cost / 10.0
 
@@ -727,6 +743,137 @@ TOOLS: list[Tool] = [
             "required": [],
         },
     ),
+    Tool(
+        name="fpl_my_team",
+        description="Analyze a manager's FPL team: current squad, form, fixtures, transfer history, overall rank progression.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "manager_id": {"type": "integer", "description": "FPL manager/entry ID"},
+                "event_id": {"type": "integer", "description": "Gameweek to analyze (defaults to current)"},
+                "fixture_horizon": {"type": "integer", "default": 5, "description": "Upcoming fixtures to include"},
+            },
+            "required": ["manager_id"],
+        },
+    ),
+    Tool(
+        name="fpl_transfer_suggestions",
+        description="Suggest transfers for a manager's team based on form, fixtures, and value.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "manager_id": {"type": "integer", "description": "FPL manager/entry ID"},
+                "positions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Positions to consider (GKP/DEF/MID/FWD). Defaults to all.",
+                },
+                "max_transfers": {"type": "integer", "default": 3, "description": "Max transfer suggestions"},
+                "horizon_gws": {"type": "integer", "default": 5, "description": "Fixture horizon for scoring"},
+            },
+            "required": ["manager_id"],
+        },
+    ),
+    Tool(
+        name="fpl_differentials",
+        description="Find low-ownership players with strong underlying stats—useful for rank climbing.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "max_ownership_pct": {"type": "number", "default": 10.0, "description": "Maximum ownership percentage"},
+                "min_form": {"type": "number", "default": 4.0, "description": "Minimum form rating"},
+                "position": {"type": "string", "description": "Optional: GKP/DEF/MID/FWD"},
+                "max_price_m": {"type": "number", "description": "Optional price cap in £m"},
+                "min_minutes": {"type": "integer", "default": 200, "description": "Minimum season minutes"},
+                "limit": {"type": "integer", "default": 20, "description": "Max results"},
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="fpl_dgw_bgw",
+        description="Detect double and blank gameweeks—teams with multiple or zero fixtures in upcoming events.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "event_start": {"type": "integer", "description": "Start gameweek (defaults to current)"},
+                "event_end": {"type": "integer", "description": "End gameweek (defaults to start + 5)"},
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="fpl_captain_picks",
+        description="Captaincy recommendations weighted for fixtures, home advantage, and penalty duties.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "integer", "description": "Gameweek (defaults to next)"},
+                "limit": {"type": "integer", "default": 10, "description": "Max results"},
+                "min_minutes": {"type": "integer", "default": 400, "description": "Minimum season minutes"},
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="fpl_compare",
+        description="Side-by-side comparison of multiple players.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "player_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "List of player IDs to compare (2-6 players)",
+                },
+                "last_matches": {"type": "integer", "default": 5, "description": "Recent matches for trend analysis"},
+            },
+            "required": ["player_ids"],
+        },
+    ),
+    Tool(
+        name="fpl_price_changes",
+        description="Players likely to rise or fall in price based on transfer activity.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "direction": {"type": "string", "description": "Filter by 'rising' or 'falling' (defaults to both)"},
+                "limit": {"type": "integer", "default": 20, "description": "Max results per direction"},
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="fpl_deadline",
+        description="Get the next gameweek deadline and time remaining.",
+        inputSchema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    ),
+    Tool(
+        name="fpl_set_piece_takers",
+        description="Identify set piece takers (penalties, corners, free kicks) by team.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "team_id": {"type": "integer", "description": "Optional: filter to specific team"},
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="fpl_live_bps",
+        description="Current bonus point standings for live/recent gameweek matches.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "integer", "description": "Gameweek (defaults to current)"},
+            },
+            "required": [],
+        },
+    ),
 ]
 
 
@@ -1024,6 +1171,644 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "concurrency": concurrency,
             },
             "results": results,
+        }
+        return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+    if name == "fpl_my_team":
+        manager_id = int(arguments.get("manager_id"))
+        event_id_arg = arguments.get("event_id")
+        fixture_horizon = int(arguments.get("fixture_horizon", 5))
+
+        bs = await _bootstrap()
+        teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
+        elements_by_id = {int(el["id"]): el for el in bs.get("elements", [])}
+        events = bs.get("events", [])
+        current_event = _current_event_id(events)
+
+        event_id = int(event_id_arg) if event_id_arg is not None else current_event
+        if event_id is None:
+            return [TextContent(type="text", text=json.dumps({"error": "No current event found"}))]
+
+        try:
+            manager_info, manager_hist, picks, transfers = await asyncio.gather(
+                _manager_info(manager_id),
+                _manager_history(manager_id),
+                _manager_picks(manager_id, event_id),
+                _manager_transfers(manager_id),
+            )
+        except httpx.HTTPStatusError as e:
+            return [TextContent(type="text", text=json.dumps({"error": f"Manager not found or API error: {e.response.status_code}"}))]
+
+        fixtures = await _fixtures()
+        team_outlook = _team_fixture_outlook(fixtures, teams_by_id, current_event, horizon_gws=fixture_horizon)
+
+        squad = []
+        for pick in picks.get("picks", []):
+            el_id = int(pick["element"])
+            el = elements_by_id.get(el_id, {})
+            team_id = int(el.get("team", 0))
+            team_fixtures = team_outlook.get(team_id, {}).get("next_opponents", [])[:fixture_horizon]
+            squad.append({
+                "id": el_id,
+                "name": el.get("web_name", str(el_id)),
+                "team": teams_by_id.get(team_id, {}).get("name", str(team_id)),
+                "position": POS_MAP.get(int(el.get("element_type", 3)), "MID"),
+                "price_m": round(_price_m(int(el.get("now_cost", 0))), 1),
+                "is_captain": pick.get("is_captain", False),
+                "is_vice_captain": pick.get("is_vice_captain", False),
+                "multiplier": pick.get("multiplier", 1),
+                "form": _to_float(el.get("form")),
+                "points_per_game": _to_float(el.get("points_per_game")),
+                "total_points": int(_to_float(el.get("total_points"))),
+                "selected_by_percent": _to_float(el.get("selected_by_percent")),
+                "status": el.get("status"),
+                "chance_of_playing": el.get("chance_of_playing_next_round"),
+                "upcoming_fixtures": team_fixtures,
+            })
+
+        current_history = manager_hist.get("current", [])
+        recent_gws = current_history[-5:] if current_history else []
+
+        recent_transfers = transfers[-10:] if isinstance(transfers, list) else []
+
+        payload = {
+            "manager": {
+                "id": manager_id,
+                "name": f"{manager_info.get('player_first_name', '')} {manager_info.get('player_last_name', '')}".strip(),
+                "team_name": manager_info.get("name"),
+                "overall_rank": manager_info.get("summary_overall_rank"),
+                "overall_points": manager_info.get("summary_overall_points"),
+                "gameweek_points": manager_info.get("summary_event_points"),
+                "value": round(_price_m(int(manager_info.get("last_deadline_value", 0))), 1),
+                "bank": round(_price_m(int(manager_info.get("last_deadline_bank", 0))), 1),
+                "free_transfers": manager_info.get("last_deadline_total_transfers"),
+            },
+            "event_id": event_id,
+            "active_chip": picks.get("active_chip"),
+            "squad": squad,
+            "recent_gameweeks": recent_gws,
+            "recent_transfers": recent_transfers,
+        }
+        return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+    if name == "fpl_transfer_suggestions":
+        manager_id = int(arguments.get("manager_id"))
+        positions_arg = arguments.get("positions")
+        max_transfers = int(arguments.get("max_transfers", 3))
+        horizon_gws = int(arguments.get("horizon_gws", 5))
+
+        bs = await _bootstrap()
+        teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
+        elements = bs.get("elements", [])
+        elements_by_id = {int(el["id"]): el for el in elements}
+        events = bs.get("events", [])
+        current_event = _current_event_id(events)
+
+        if current_event is None:
+            return [TextContent(type="text", text=json.dumps({"error": "No current event found"}))]
+
+        try:
+            picks = await _manager_picks(manager_id, current_event)
+        except httpx.HTTPStatusError as e:
+            return [TextContent(type="text", text=json.dumps({"error": f"Manager not found: {e.response.status_code}"}))]
+
+        fixtures = await _fixtures()
+
+        current_squad_ids = {int(p["element"]) for p in picks.get("picks", [])}
+
+        pos_filters: set[str] = set()
+        if positions_arg:
+            pos_filters = {str(p).strip().upper() for p in positions_arg}
+
+        squad_by_pos: dict[str, list[dict[str, Any]]] = {"GKP": [], "DEF": [], "MID": [], "FWD": []}
+        for pid in current_squad_ids:
+            el = elements_by_id.get(pid, {})
+            pos = POS_MAP.get(int(el.get("element_type", 3)), "MID")
+            scored = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws, current_event)
+            squad_by_pos[pos].append(scored)
+
+        for pos_list in squad_by_pos.values():
+            pos_list.sort(key=lambda x: x["base_score"])
+
+        suggestions = []
+        for pos in ["GKP", "DEF", "MID", "FWD"]:
+            if pos_filters and pos not in pos_filters:
+                continue
+            if not squad_by_pos[pos]:
+                continue
+
+            weakest = squad_by_pos[pos][0]
+            weakest_price = weakest["price_m"]
+
+            candidates = []
+            for el in elements:
+                if int(el["id"]) in current_squad_ids:
+                    continue
+                el_pos = POS_MAP.get(int(el["element_type"]), "MID")
+                if el_pos != pos:
+                    continue
+                if str(el.get("status", "a")) != "a":
+                    continue
+                price = _price_m(int(el["now_cost"]))
+                if price > weakest_price + 2.0:
+                    continue
+
+                scored = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws, current_event)
+                if scored["base_score"] > weakest["base_score"]:
+                    candidates.append({
+                        "out": weakest,
+                        "in": scored,
+                        "score_gain": round(scored["base_score"] - weakest["base_score"], 3),
+                        "cost_diff": round(price - weakest_price, 1),
+                    })
+
+            candidates.sort(key=lambda x: x["score_gain"], reverse=True)
+            suggestions.extend(candidates[:max_transfers])
+
+        suggestions.sort(key=lambda x: x["score_gain"], reverse=True)
+
+        payload = {
+            "manager_id": manager_id,
+            "current_event": current_event,
+            "suggestions": suggestions[:max_transfers],
+        }
+        return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+    if name == "fpl_differentials":
+        max_ownership = float(arguments.get("max_ownership_pct", 10.0))
+        min_form = float(arguments.get("min_form", 4.0))
+        position = arguments.get("position")
+        max_price_m = arguments.get("max_price_m")
+        min_minutes = int(arguments.get("min_minutes", 200))
+        limit = int(arguments.get("limit", 20))
+
+        bs = await _bootstrap()
+        teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
+        elements = bs.get("elements", [])
+        events = bs.get("events", [])
+        current_event = _current_event_id(events)
+        fixtures = await _fixtures()
+
+        pos_filter: str | None = None
+        if position:
+            pos_filter = str(position).strip().upper()
+
+        differentials = []
+        for el in elements:
+            ownership = _to_float(el.get("selected_by_percent"))
+            if ownership > max_ownership:
+                continue
+
+            form = _to_float(el.get("form"))
+            if form < min_form:
+                continue
+
+            if int(_to_float(el.get("minutes"))) < min_minutes:
+                continue
+
+            if str(el.get("status", "a")) != "a":
+                continue
+
+            pos = POS_MAP.get(int(el["element_type"]), "MID")
+            if pos_filter and pos != pos_filter:
+                continue
+
+            price = _price_m(int(el["now_cost"]))
+            if max_price_m is not None and price > float(max_price_m):
+                continue
+
+            scored = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws=5, current_event=current_event)
+            scored["ownership_pct"] = ownership
+            differentials.append(scored)
+
+        differentials.sort(key=lambda x: x["base_score"], reverse=True)
+
+        payload = {
+            "params": {
+                "max_ownership_pct": max_ownership,
+                "min_form": min_form,
+                "position": position,
+                "min_minutes": min_minutes,
+            },
+            "count": len(differentials[:limit]),
+            "differentials": differentials[:limit],
+        }
+        return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+    if name == "fpl_dgw_bgw":
+        bs = await _bootstrap()
+        events = bs.get("events", [])
+        teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
+        current_event = _current_event_id(events)
+
+        event_start = arguments.get("event_start")
+        event_end = arguments.get("event_end")
+
+        if event_start is None:
+            event_start = current_event or 1
+        event_start = int(event_start)
+
+        if event_end is None:
+            event_end = event_start + 5
+        event_end = int(event_end)
+
+        fixtures = await _fixtures()
+
+        team_fixture_count: dict[int, dict[int, int]] = {}
+        for fx in fixtures:
+            ev = fx.get("event")
+            if ev is None:
+                continue
+            ev = int(ev)
+            if ev < event_start or ev > event_end:
+                continue
+
+            for team_key in ("team_h", "team_a"):
+                team_id = fx.get(team_key)
+                if team_id is None:
+                    continue
+                team_id = int(team_id)
+                if team_id not in team_fixture_count:
+                    team_fixture_count[team_id] = {}
+                team_fixture_count[team_id][ev] = team_fixture_count[team_id].get(ev, 0) + 1
+
+        dgw_events: dict[int, list[dict[str, Any]]] = {}
+        bgw_events: dict[int, list[dict[str, Any]]] = {}
+
+        for team_id, ev_counts in team_fixture_count.items():
+            team_name = teams_by_id.get(team_id, {}).get("name", str(team_id))
+            for ev, count in ev_counts.items():
+                if count >= 2:
+                    if ev not in dgw_events:
+                        dgw_events[ev] = []
+                    dgw_events[ev].append({"team_id": team_id, "team": team_name, "fixtures": count})
+
+        all_team_ids = set(teams_by_id.keys())
+        for ev in range(event_start, event_end + 1):
+            teams_with_fixtures = {tid for tid, ev_counts in team_fixture_count.items() if ev in ev_counts}
+            blanking = all_team_ids - teams_with_fixtures
+            if blanking:
+                if ev not in bgw_events:
+                    bgw_events[ev] = []
+                for tid in blanking:
+                    bgw_events[ev].append({
+                        "team_id": tid,
+                        "team": teams_by_id.get(tid, {}).get("name", str(tid)),
+                        "fixtures": 0,
+                    })
+
+        payload = {
+            "event_range": [event_start, event_end],
+            "double_gameweeks": {str(k): v for k, v in sorted(dgw_events.items())},
+            "blank_gameweeks": {str(k): v for k, v in sorted(bgw_events.items())},
+        }
+        return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+    if name == "fpl_captain_picks":
+        event_id_arg = arguments.get("event_id")
+        limit = int(arguments.get("limit", 10))
+        min_minutes = int(arguments.get("min_minutes", 400))
+
+        bs = await _bootstrap()
+        teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
+        elements = bs.get("elements", [])
+        events = bs.get("events", [])
+        current_event = _current_event_id(events)
+
+        target_event = int(event_id_arg) if event_id_arg is not None else current_event
+        if target_event is None:
+            return [TextContent(type="text", text=json.dumps({"error": "No event found"}))]
+
+        fixtures = await _fixtures()
+
+        event_fixtures: dict[int, list[dict[str, Any]]] = {}
+        for fx in fixtures:
+            ev = fx.get("event")
+            if ev is None or int(ev) != target_event:
+                continue
+            for team_key, opp_key, diff_key, is_home in [
+                ("team_h", "team_a", "team_h_difficulty", True),
+                ("team_a", "team_h", "team_a_difficulty", False),
+            ]:
+                team_id = fx.get(team_key)
+                if team_id is None:
+                    continue
+                team_id = int(team_id)
+                if team_id not in event_fixtures:
+                    event_fixtures[team_id] = []
+                event_fixtures[team_id].append({
+                    "opponent": fx.get(opp_key),
+                    "difficulty": int(_to_float(fx.get(diff_key))),
+                    "is_home": is_home,
+                })
+
+        captain_scores = []
+        for el in elements:
+            if int(_to_float(el.get("minutes"))) < min_minutes:
+                continue
+            if str(el.get("status", "a")) != "a":
+                continue
+
+            team_id = int(el["team"])
+            team_fx = event_fixtures.get(team_id, [])
+            if not team_fx:
+                continue
+
+            ppg = _to_float(el.get("points_per_game"))
+            form = _to_float(el.get("form"))
+            ict = _to_float(el.get("ict_index"))
+            threat = _to_float(el.get("threat"))
+
+            home_bonus = 0.5 if any(f["is_home"] for f in team_fx) else 0.0
+            avg_diff = sum(f["difficulty"] for f in team_fx) / len(team_fx)
+            fixture_ease = 6.0 - avg_diff
+            dgw_multiplier = len(team_fx)
+
+            penalty_bonus = 0.0
+            if _to_float(el.get("penalties_order", 99)) <= 2:
+                penalty_bonus = 1.5
+
+            captain_score = (
+                (form * 2.0)
+                + (ppg * 1.5)
+                + (threat * 0.01)
+                + (ict * 0.05)
+                + (fixture_ease * 1.2)
+                + home_bonus
+                + penalty_bonus
+            ) * dgw_multiplier
+
+            name = f"{el.get('first_name', '')} {el.get('second_name', '')}".strip() or el.get("web_name")
+            captain_scores.append({
+                "id": int(el["id"]),
+                "name": name,
+                "web_name": el.get("web_name"),
+                "team": teams_by_id.get(team_id, {}).get("name", str(team_id)),
+                "position": POS_MAP.get(int(el["element_type"]), "MID"),
+                "captain_score": round(captain_score, 3),
+                "form": form,
+                "points_per_game": ppg,
+                "fixtures": team_fx,
+                "is_home": any(f["is_home"] for f in team_fx),
+                "on_penalties": _to_float(el.get("penalties_order", 99)) <= 2,
+            })
+
+        captain_scores.sort(key=lambda x: x["captain_score"], reverse=True)
+
+        payload = {
+            "event_id": target_event,
+            "captain_picks": captain_scores[:limit],
+        }
+        return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+    if name == "fpl_compare":
+        player_ids = arguments.get("player_ids", [])
+        last_matches = int(arguments.get("last_matches", 5))
+
+        if not player_ids or len(player_ids) < 2:
+            return [TextContent(type="text", text=json.dumps({"error": "Provide at least 2 player IDs"}))]
+        if len(player_ids) > 6:
+            player_ids = player_ids[:6]
+
+        bs = await _bootstrap()
+        teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
+        elements_by_id = {int(el["id"]): el for el in bs.get("elements", [])}
+        events = bs.get("events", [])
+        current_event = _current_event_id(events)
+        fixtures = await _fixtures()
+
+        sem = asyncio.Semaphore(6)
+
+        async def fetch_player(pid: int) -> dict[str, Any] | None:
+            el = elements_by_id.get(pid)
+            if el is None:
+                return {"id": pid, "error": "Player not found"}
+
+            async with sem:
+                es = await _element_summary(pid)
+
+            team_id = int(el["team"])
+            recent = _recent_form_from_element_summary(es, last_matches=last_matches)
+            scored = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws=5, current_event=current_event)
+
+            upcoming = es.get("fixtures", [])[:5]
+            upcoming_simple = []
+            for fx in upcoming:
+                opp_id = fx.get("opponent_team")
+                upcoming_simple.append({
+                    "event": fx.get("event"),
+                    "opponent": teams_by_id.get(int(opp_id), {}).get("name") if opp_id else None,
+                    "difficulty": fx.get("difficulty"),
+                    "is_home": fx.get("is_home"),
+                })
+
+            return {
+                "id": pid,
+                "name": f"{el.get('first_name', '')} {el.get('second_name', '')}".strip() or el.get("web_name"),
+                "web_name": el.get("web_name"),
+                "team": teams_by_id.get(team_id, {}).get("name", str(team_id)),
+                "position": POS_MAP.get(int(el["element_type"]), "MID"),
+                "price_m": round(_price_m(int(el["now_cost"])), 1),
+                "ownership_pct": _to_float(el.get("selected_by_percent")),
+                "season_stats": {
+                    "total_points": int(_to_float(el.get("total_points"))),
+                    "points_per_game": _to_float(el.get("points_per_game")),
+                    "minutes": int(_to_float(el.get("minutes"))),
+                    "goals": int(_to_float(el.get("goals_scored"))),
+                    "assists": int(_to_float(el.get("assists"))),
+                    "clean_sheets": int(_to_float(el.get("clean_sheets"))),
+                    "xGI": _to_float(el.get("expected_goal_involvements")),
+                    "ict_index": _to_float(el.get("ict_index")),
+                },
+                "recent": recent,
+                "base_score": scored["base_score"],
+                "upcoming_fixtures": upcoming_simple,
+                "status": el.get("status"),
+            }
+
+        results = await asyncio.gather(*(fetch_player(int(pid)) for pid in player_ids))
+
+        payload = {
+            "comparison": results,
+            "params": {"player_ids": player_ids, "last_matches": last_matches},
+        }
+        return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+    if name == "fpl_price_changes":
+        direction = arguments.get("direction")
+        limit = int(arguments.get("limit", 20))
+
+        bs = await _bootstrap()
+        teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
+        elements = bs.get("elements", [])
+
+        rising = []
+        falling = []
+
+        for el in elements:
+            transfers_in = int(_to_float(el.get("transfers_in_event")))
+            transfers_out = int(_to_float(el.get("transfers_out_event")))
+            net = transfers_in - transfers_out
+
+            team_id = int(el["team"])
+            player_data = {
+                "id": int(el["id"]),
+                "name": el.get("web_name"),
+                "team": teams_by_id.get(team_id, {}).get("name", str(team_id)),
+                "position": POS_MAP.get(int(el["element_type"]), "MID"),
+                "price_m": round(_price_m(int(el["now_cost"])), 1),
+                "transfers_in": transfers_in,
+                "transfers_out": transfers_out,
+                "net_transfers": net,
+                "ownership_pct": _to_float(el.get("selected_by_percent")),
+            }
+
+            if net > 0:
+                rising.append(player_data)
+            elif net < 0:
+                falling.append(player_data)
+
+        rising.sort(key=lambda x: x["net_transfers"], reverse=True)
+        falling.sort(key=lambda x: x["net_transfers"])
+
+        payload: dict[str, Any] = {}
+        if direction is None or direction == "rising":
+            payload["rising"] = rising[:limit]
+        if direction is None or direction == "falling":
+            payload["falling"] = falling[:limit]
+
+        return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+    if name == "fpl_deadline":
+        bs = await _bootstrap()
+        events = bs.get("events", [])
+
+        next_event = next((e for e in events if e.get("is_next")), None)
+        current_event = next((e for e in events if e.get("is_current")), None)
+
+        if next_event:
+            deadline = next_event.get("deadline_time")
+            payload = {
+                "event_id": next_event.get("id"),
+                "event_name": next_event.get("name"),
+                "deadline_time": deadline,
+                "finished": next_event.get("finished"),
+                "is_current": False,
+                "is_next": True,
+            }
+        elif current_event:
+            deadline = current_event.get("deadline_time")
+            payload = {
+                "event_id": current_event.get("id"),
+                "event_name": current_event.get("name"),
+                "deadline_time": deadline,
+                "finished": current_event.get("finished"),
+                "is_current": True,
+                "is_next": False,
+            }
+        else:
+            payload = {"error": "No upcoming deadline found"}
+
+        return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+    if name == "fpl_set_piece_takers":
+        team_id_filter = arguments.get("team_id")
+
+        bs = await _bootstrap()
+        teams = bs.get("teams", [])
+        elements = bs.get("elements", [])
+        elements_by_id = {int(el["id"]): el for el in elements}
+
+        result = []
+        for team in teams:
+            tid = int(team["id"])
+            if team_id_filter is not None and tid != int(team_id_filter):
+                continue
+
+            penalties_order = team.get("penalties_order") or []
+            corners_order = team.get("corners_and_indirect_freekicks_order") or []
+            fk_order = team.get("direct_freekicks_order") or []
+
+            def resolve_names(id_list: list) -> list[dict[str, Any]]:
+                out = []
+                for pid in id_list[:3]:
+                    el = elements_by_id.get(int(pid), {})
+                    out.append({
+                        "id": int(pid),
+                        "name": el.get("web_name", str(pid)),
+                    })
+                return out
+
+            result.append({
+                "team_id": tid,
+                "team": team.get("name"),
+                "penalties": resolve_names(penalties_order),
+                "corners_indirect_fks": resolve_names(corners_order),
+                "direct_fks": resolve_names(fk_order),
+            })
+
+        payload = {"teams": result}
+        return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+    if name == "fpl_live_bps":
+        event_id_arg = arguments.get("event_id")
+
+        bs = await _bootstrap()
+        events = bs.get("events", [])
+        teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
+        elements_by_id = {int(el["id"]): el for el in bs.get("elements", [])}
+        current_event = _current_event_id(events)
+
+        event_id = int(event_id_arg) if event_id_arg is not None else current_event
+        if event_id is None:
+            return [TextContent(type="text", text=json.dumps({"error": "No event found"}))]
+
+        fixtures = await _fixtures()
+        live_data = await _event_live(event_id)
+
+        event_fixtures = [fx for fx in fixtures if fx.get("event") == event_id]
+
+        live_elements = live_data.get("elements", [])
+        bps_by_id = {int(el["id"]): el.get("stats", {}).get("bps", 0) for el in live_elements}
+
+        fixture_bps = []
+        for fx in event_fixtures:
+            fx_id = fx.get("id")
+            team_h = fx.get("team_h")
+            team_a = fx.get("team_a")
+            team_h_name = teams_by_id.get(int(team_h), {}).get("name") if team_h else None
+            team_a_name = teams_by_id.get(int(team_a), {}).get("name") if team_a else None
+
+            bps_stats = fx.get("stats", [])
+            bps_data = next((s for s in bps_stats if s.get("identifier") == "bps"), None)
+
+            leaders = []
+            if bps_data:
+                all_bps = bps_data.get("h", []) + bps_data.get("a", [])
+                all_bps.sort(key=lambda x: x.get("value", 0), reverse=True)
+                for entry in all_bps[:5]:
+                    el_id = entry.get("element")
+                    el = elements_by_id.get(int(el_id), {})
+                    leaders.append({
+                        "id": el_id,
+                        "name": el.get("web_name", str(el_id)),
+                        "team": teams_by_id.get(int(el.get("team", 0)), {}).get("name"),
+                        "bps": entry.get("value"),
+                    })
+
+            fixture_bps.append({
+                "fixture_id": fx_id,
+                "teams": f"{team_h_name} vs {team_a_name}",
+                "started": fx.get("started"),
+                "finished": fx.get("finished"),
+                "minutes": fx.get("minutes"),
+                "score": f"{fx.get('team_h_score', '-')} - {fx.get('team_a_score', '-')}",
+                "bps_leaders": leaders,
+            })
+
+        payload = {
+            "event_id": event_id,
+            "fixtures": fixture_bps,
         }
         return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
 
