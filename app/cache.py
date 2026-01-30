@@ -1,17 +1,18 @@
-"""Redis cache using RedisJSON."""
+"""Redis cache with fallback for providers without RedisJSON."""
 
+import json
 import logging
 import redis.asyncio as redis
 from config import get_settings
 
 logger = logging.getLogger(__name__)
 _client: redis.Redis | None = None
-ROOT = "$"
+_has_json_module: bool = False
 
 
 async def init_cache() -> bool:
-    """Initialize Redis connection."""
-    global _client
+    """Initialize Redis connection and detect capabilities."""
+    global _client, _has_json_module
     settings = get_settings()
 
     try:
@@ -24,6 +25,17 @@ async def init_cache() -> bool:
             decode_responses=True,
         )
         await _client.ping()
+
+        # Detect if RedisJSON module is available
+        try:
+            await _client.execute_command("JSON.SET", "_test_json", "$", '"test"')
+            await _client.delete("_test_json")
+            _has_json_module = True
+            logger.info("RedisJSON module detected")
+        except redis.ResponseError:
+            _has_json_module = False
+            logger.info("RedisJSON not available, using standard Redis with JSON serialization")
+
         mode = "external" if settings.is_external_redis else "local"
         ssl_status = " (SSL)" if settings.redis_ssl else ""
         logger.info(f"Connected to Redis ({mode}) at {settings.redis_host}:{settings.redis_port}{ssl_status}")
@@ -47,12 +59,20 @@ async def cache_get(key: str):
     if not _client:
         return None
     try:
-        result = await _client.json().get(key, ROOT)
-        # RedisJSON with "$" path returns results wrapped in a list
-        if isinstance(result, list) and len(result) == 1:
-            return result[0]
-        return result
-    except Exception:
+        if _has_json_module:
+            result = await _client.json().get(key, "$")
+            # RedisJSON with "$" path returns results wrapped in a list
+            if isinstance(result, list) and len(result) == 1:
+                return result[0]
+            return result
+        else:
+            # Standard Redis: deserialize JSON string
+            result = await _client.get(key)
+            if result is None:
+                return None
+            return json.loads(result)
+    except Exception as e:
+        logger.debug(f"Cache get error for {key}: {e}")
         return None
 
 
@@ -61,11 +81,26 @@ async def cache_set(key: str, value, ttl: int = 3600) -> bool:
     if not _client:
         return False
     try:
-        await _client.json().set(key, ROOT, value)
-        await _client.expire(key, ttl)
+        if _has_json_module:
+            await _client.json().set(key, "$", value)
+            await _client.expire(key, ttl)
+        else:
+            # Standard Redis: serialize to JSON string
+            await _client.set(key, json.dumps(value, default=str), ex=ttl)
         return True
     except Exception as e:
         logger.warning(f"Cache set error: {e}")
+        return False
+
+
+async def cache_delete(key: str) -> bool:
+    """Delete key from cache."""
+    if not _client:
+        return False
+    try:
+        await _client.delete(key)
+        return True
+    except Exception:
         return False
 
 
