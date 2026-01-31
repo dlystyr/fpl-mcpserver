@@ -1,32 +1,28 @@
-# FPL MCP Server Docker Compose
-# ==============================
+# FPL MCP Server - All-in-One Docker Compose
+# ============================================
 #
-# USAGE:
+# Start everything:
+#   docker-compose up -d
 #
-# Local Development (with local PostgreSQL and Redis):
-#   docker-compose --profile local up -d
-#   docker-compose --profile local --profile sync up fpl-sync  # Run sync
+# Run data sync (after services are up):
+#   docker-compose run --rm fpl-sync
 #
-# External Databases (PostgreSQL/Redis hosted elsewhere):
-#   1. Configure .env with DATABASE_URL, REDIS_HOST, etc.
-#   2. docker-compose up -d fpl-mcp
-#   3. docker-compose up fpl-sync  # Run sync
+# View logs:
+#   docker-compose logs -f fpl-mcp
 #
-# All-in-One (local dev with everything):
-#   docker-compose --profile local --profile sync up -d
+# Stop everything:
+#   docker-compose down
 #
+# Reset data (careful!):
+#   docker-compose down -v
 
 services:
   # ===========================================================================
-  # LOCAL INFRASTRUCTURE (profile: local)
-  # Only started when using --profile local
+  # PostgreSQL Database
   # ===========================================================================
-
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18.1
     container_name: fpl-postgres
-    profiles:
-      - local
     environment:
       POSTGRES_DB: fpl
       POSTGRES_USER: fpl
@@ -43,11 +39,13 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # ===========================================================================
+  # Redis 8.4 (includes RedisJSON, RedisSearch, etc. built-in)
+  # ===========================================================================
   redis:
-    image: redis/redis-stack-server:latest
+    image: redis:8.4.0
     container_name: fpl-redis
-    profiles:
-      - local
+    command: redis-server --appendonly yes
     ports:
       - "6379:6379"
     volumes:
@@ -60,10 +58,8 @@ services:
     restart: unless-stopped
 
   # ===========================================================================
-  # MCP SERVER
-  # Works with both local and external databases
+  # MCP Server
   # ===========================================================================
-
   fpl-mcp:
     build:
       context: .
@@ -73,17 +69,12 @@ services:
     ports:
       - "${PORT:-8000}:8000"
     environment:
-      # Database: Use DATABASE_URL if set, otherwise default to local postgres
-      - DATABASE_URL=${DATABASE_URL:-postgresql://fpl:${POSTGRES_PASSWORD:-fplpass}@postgres:5432/fpl}
-      # Redis: Use external settings if REDIS_HOST is set, otherwise default to local
-      - REDIS_HOST=${REDIS_HOST:-redis}
-      - REDIS_PORT=${REDIS_PORT:-6379}
-      - REDIS_USER=${REDIS_USER:-}
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
-      - REDIS_SSL=${REDIS_SSL:-false}
-      # Auth
+      - DATABASE_URL=postgresql://fpl:${POSTGRES_PASSWORD:-fplpass}@postgres:5432/fpl
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=
+      - REDIS_SSL=false
       - API_KEY=${API_KEY:-}
-      # Logging
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -92,48 +83,35 @@ services:
       retries: 3
       start_period: 10s
     restart: unless-stopped
-    # When using local profile, depend on postgres and redis
-    # When using external, these dependencies are ignored (services don't exist)
     depends_on:
       postgres:
         condition: service_healthy
-        required: false
       redis:
         condition: service_healthy
-        required: false
 
   # ===========================================================================
-  # DATA SYNC SERVICE (profile: sync)
-  # Run on-demand to sync FPL data
+  # Data Sync Service (run on-demand)
+  # Usage: docker-compose run --rm fpl-sync
   # ===========================================================================
-
   fpl-sync:
     build:
       context: .
       dockerfile: Dockerfile.sync
     image: fpl-sync:latest
-    container_name: fpl-sync
     profiles:
-      - sync
+      - sync  # Only runs when explicitly called
     environment:
-      # Database: Use DATABASE_URL if set, otherwise default to local postgres
-      - DATABASE_URL=${DATABASE_URL:-postgresql://fpl:${POSTGRES_PASSWORD:-fplpass}@postgres:5432/fpl}
-      # Redis: Use external settings if REDIS_HOST is set, otherwise default to local
-      - REDIS_HOST=${REDIS_HOST:-redis}
-      - REDIS_PORT=${REDIS_PORT:-6379}
-      - REDIS_USER=${REDIS_USER:-}
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
-      - REDIS_SSL=${REDIS_SSL:-false}
-      # Logging
+      - DATABASE_URL=postgresql://fpl:${POSTGRES_PASSWORD:-fplpass}@postgres:5432/fpl
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=
+      - REDIS_SSL=false
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    # When using local profile, depend on postgres and redis
     depends_on:
       postgres:
         condition: service_healthy
-        required: false
       redis:
         condition: service_healthy
-        required: false
 
 volumes:
   postgres-data:

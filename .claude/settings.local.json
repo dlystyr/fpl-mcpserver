@@ -4,7 +4,13 @@
       "Bash(cat:*)",
       "Bash(python -m py_compile:*)",
       "Bash(docker-compose config:*)",
-      "Bash(python -c:*)"
+      "Bash(python -c:*)",
+      "WebFetch(domain:www.fpl-data.co.uk)",
+      "WebSearch",
+      "WebFetch(domain:www.bbc.co.uk)",
+      "WebFetch(domain:collinb9.github.io)",
+      "WebFetch(domain:soccerdata.readthedocs.io)",
+      "Bash(uv sync:*)"
     ]
   }
 }

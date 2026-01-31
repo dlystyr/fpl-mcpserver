@@ -17,6 +17,8 @@ from starlette.responses import JSONResponse, Response
 from starlette.routing import Mount, Route
 import uvicorn
 
+from fpl_mcp.enrichment import enrich_player_async
+
 logger = logging.getLogger("fpl-mcp")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
@@ -185,9 +187,634 @@ def _fixture_difficulty_for_team(fx: dict[str, Any], team_id: int) -> int | None
     return None
 
 
-def _availability_penalty(el: dict[str, Any]) -> float:
+def _calculate_team_strength(teams: list[dict[str, Any]]) -> dict[int, dict[str, float]]:
+    """
+    Calculate attack and defense strength multipliers for each team relative to league average.
+
+    Uses bootstrap strength_attack_home, strength_attack_away, strength_defence_home,
+    strength_defence_away fields. Returns multipliers where 1.0 = league average.
+
+    Returns dict of team_id -> {
+        "attack_home": float,
+        "attack_away": float,
+        "defense_home": float,  # Lower = better defense
+        "defense_away": float,
+    }
+    """
+    if not teams:
+        return {}
+
+    # Calculate league averages
+    attack_home_vals = [_to_float(t.get("strength_attack_home", 1000)) for t in teams]
+    attack_away_vals = [_to_float(t.get("strength_attack_away", 1000)) for t in teams]
+    defense_home_vals = [_to_float(t.get("strength_defence_home", 1000)) for t in teams]
+    defense_away_vals = [_to_float(t.get("strength_defence_away", 1000)) for t in teams]
+
+    avg_attack_home = sum(attack_home_vals) / len(teams) if teams else 1000.0
+    avg_attack_away = sum(attack_away_vals) / len(teams) if teams else 1000.0
+    avg_defense_home = sum(defense_home_vals) / len(teams) if teams else 1000.0
+    avg_defense_away = sum(defense_away_vals) / len(teams) if teams else 1000.0
+
+    strength: dict[int, dict[str, float]] = {}
+    for t in teams:
+        team_id = int(t["id"])
+        strength[team_id] = {
+            "attack_home": _to_float(t.get("strength_attack_home", 1000)) / avg_attack_home if avg_attack_home else 1.0,
+            "attack_away": _to_float(t.get("strength_attack_away", 1000)) / avg_attack_away if avg_attack_away else 1.0,
+            "defense_home": _to_float(t.get("strength_defence_home", 1000)) / avg_defense_home if avg_defense_home else 1.0,
+            "defense_away": _to_float(t.get("strength_defence_away", 1000)) / avg_defense_away if avg_defense_away else 1.0,
+        }
+
+    return strength
+
+
+# Position mean per-90 stats for Bayesian shrinkage (based on typical PL season averages)
+POSITION_MEANS_PER90 = {
+    "GKP": {"xg": 0.0, "xa": 0.01, "xgi": 0.01, "points": 3.5},
+    "DEF": {"xg": 0.04, "xa": 0.05, "xgi": 0.09, "points": 4.0},
+    "MID": {"xg": 0.15, "xa": 0.12, "xgi": 0.27, "points": 4.5},
+    "FWD": {"xg": 0.35, "xa": 0.10, "xgi": 0.45, "points": 4.8},
+}
+
+
+def _calculate_team_attacking_context(
+    team_id: int,
+    team_strength: dict[int, dict[str, float]],
+    elements: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """
+    Calculate team attacking quality context for a player's team.
+
+    Uses ACTUAL goals scored (not just FPL strength ratings) to determine
+    attack quality. This catches teams like Arsenal where goals come from
+    all positions, not just traditional attackers.
+
+    Returns dict with attack strength, team goals, goal distribution, and quality label.
+    """
+    # Get FPL strength ratings (for reference, but not primary quality measure)
+    ts = team_strength.get(team_id, {})
+    attack_home = ts.get("attack_home", 1.0)
+    attack_away = ts.get("attack_away", 1.0)
+    fpl_attack_rating = (attack_home + attack_away) / 2
+
+    # Calculate team's total goals and xG by position
+    team_players = [el for el in elements if int(el.get("team", 0)) == team_id]
+    team_xg = sum(_to_float(el.get("expected_goals", 0)) for el in team_players)
+    team_xa = sum(_to_float(el.get("expected_assists", 0)) for el in team_players)
+    team_goals = sum(int(_to_float(el.get("goals_scored", 0))) for el in team_players)
+    team_assists = sum(int(_to_float(el.get("assists", 0))) for el in team_players)
+
+    # Goals by position (to understand goal spread)
+    def_goals = sum(
+        int(_to_float(el.get("goals_scored", 0)))
+        for el in team_players
+        if int(el.get("element_type", 0)) == 2  # DEF
+    )
+    mid_goals = sum(
+        int(_to_float(el.get("goals_scored", 0)))
+        for el in team_players
+        if int(el.get("element_type", 0)) == 3  # MID
+    )
+    fwd_goals = sum(
+        int(_to_float(el.get("goals_scored", 0)))
+        for el in team_players
+        if int(el.get("element_type", 0)) == 4  # FWD
+    )
+
+    # Get team FPL points for attackers (MID + FWD)
+    attacker_points = sum(
+        int(_to_float(el.get("total_points", 0)))
+        for el in team_players
+        if int(el.get("element_type", 0)) in (3, 4)
+    )
+
+    # Calculate ALL teams' goals to rank this team
+    all_team_ids = set(int(el.get("team", 0)) for el in elements)
+    team_goal_totals: list[tuple[int, int]] = []
+    for tid in all_team_ids:
+        t_goals = sum(
+            int(_to_float(el.get("goals_scored", 0)))
+            for el in elements
+            if int(el.get("team", 0)) == tid
+        )
+        team_goal_totals.append((tid, t_goals))
+
+    # Sort by goals descending to get ranking
+    team_goal_totals.sort(key=lambda x: x[1], reverse=True)
+    goals_rank = next((i + 1 for i, (tid, _) in enumerate(team_goal_totals) if tid == team_id), 10)
+
+    # Calculate league average goals
+    total_goals = sum(g for _, g in team_goal_totals)
+    avg_team_goals = total_goals / len(team_goal_totals) if team_goal_totals else 30.0
+
+    # Use ACTUAL goals (rank) to determine quality, not FPL strength rating
+    # This fixes the Arsenal issue where goals come from all positions
+    if goals_rank <= 3:
+        attack_quality = "elite_attack"
+    elif goals_rank <= 6:
+        attack_quality = "strong_attack"
+    elif goals_rank <= 12:
+        attack_quality = "average_attack"
+    elif goals_rank <= 17:
+        attack_quality = "weak_attack"
+    else:
+        attack_quality = "poor_attack"
+
+    # Goal spread description
+    if team_goals > 0:
+        def_pct = round(def_goals / team_goals * 100, 1) if team_goals else 0
+        fwd_pct = round(fwd_goals / team_goals * 100, 1) if team_goals else 0
+        if def_pct >= 20:
+            goal_spread = "goals_from_all_positions"
+        elif fwd_pct >= 60:
+            goal_spread = "striker_dependent"
+        else:
+            goal_spread = "balanced_midfield_attack"
+    else:
+        goal_spread = "no_goals"
+
+    return {
+        "attack_quality": attack_quality,
+        "goals_rank": goals_rank,
+        "team_goals": team_goals,
+        "team_xg": round(team_xg, 1),
+        "goals_vs_league_avg": round(team_goals - avg_team_goals, 1),
+        "goal_distribution": {
+            "from_defenders": def_goals,
+            "from_midfielders": mid_goals,
+            "from_forwards": fwd_goals,
+            "spread_type": goal_spread,
+        },
+        "team_xa": round(team_xa, 1),
+        "team_assists": team_assists,
+        "fpl_attack_rating": round(fpl_attack_rating, 2),
+        "fpl_attack_home": round(attack_home, 2),
+        "fpl_attack_away": round(attack_away, 2),
+        "attacker_fpl_points": attacker_points,
+    }
+
+
+def _shrink_per90_stats(
+    player_per90: dict[str, float],
+    minutes: int,
+    position: str,
+) -> dict[str, float]:
+    """
+    Apply Bayesian shrinkage to per-90 stats based on sample size (minutes).
+
+    For players with low minutes, shrink their per-90 stats toward the position mean.
+    This prevents overweighting fluky performances from small samples.
+
+    Args:
+        player_per90: Dict with keys like "xg", "xa", "xgi", "points" (per-90 values)
+        minutes: Total minutes played this season
+        position: Player position (GKP, DEF, MID, FWD)
+
+    Returns:
+        Dict with shrunk per-90 values. Full weight at 900+ minutes,
+        linear interpolation below.
+    """
+    # Full trust at 900+ minutes (10 full games), zero trust at 0 minutes
+    full_weight_minutes = 900
+    weight = min(1.0, minutes / full_weight_minutes)
+
+    position_means = POSITION_MEANS_PER90.get(position, POSITION_MEANS_PER90["MID"])
+
+    shrunk: dict[str, float] = {}
+    for stat, player_val in player_per90.items():
+        mean_val = position_means.get(stat, 0.0)
+        # Weighted average: (weight * player) + ((1 - weight) * mean)
+        shrunk[stat] = round((weight * player_val) + ((1.0 - weight) * mean_val), 4)
+
+    return shrunk
+
+
+def _calculate_confidence_score(
+    el: dict[str, Any],
+    avg_minutes: float,
+    season_minutes: int,
+) -> dict[str, Any]:
+    """
+    Calculate a 0-100 confidence score for projections.
+
+    Higher score = more confident in the projection.
+    Based on: minutes sample, nailed status, availability, form consistency.
+
+    Returns dict with score and breakdown.
+    """
+    components: dict[str, float] = {}
+
+    # 1. Sample size confidence (0-30 points)
+    # Full confidence at 1800+ minutes (20 games), scales linearly
+    sample_score = min(30, (season_minutes / 1800) * 30)
+    components["sample_size"] = round(sample_score, 1)
+
+    # 2. Nailed starter confidence (0-25 points)
+    # Full confidence at 85+ avg minutes, scales linearly from 45
+    if avg_minutes >= 85:
+        nailed_score = 25
+    elif avg_minutes >= 45:
+        nailed_score = ((avg_minutes - 45) / 40) * 25
+    else:
+        nailed_score = 0
+    components["nailed_status"] = round(nailed_score, 1)
+
+    # 3. Availability confidence (0-25 points)
+    status = str(el.get("status", "a"))
+    chance = el.get("chance_of_playing_next_round")
+
+    if status == "a" and chance is None:
+        avail_score = 25  # Fully available, no concerns
+    elif status == "a" and chance is not None:
+        avail_score = 15 + (_to_float(chance, 100) / 100) * 10  # 15-25 based on chance
+    elif status == "d":  # Doubtful
+        avail_score = 5
+    else:  # Injured, suspended, unavailable
+        avail_score = 0
+    components["availability"] = round(avail_score, 1)
+
+    # 4. Form consistency confidence (0-20 points)
+    # Based on form rating (higher form = more consistent recent performance)
+    form = _to_float(el.get("form", 0))
+    if form >= 6:
+        form_score = 20
+    elif form >= 4:
+        form_score = 15
+    elif form >= 2:
+        form_score = 10
+    elif form > 0:
+        form_score = 5
+    else:
+        form_score = 0
+    components["form_consistency"] = round(form_score, 1)
+
+    total_score = sum(components.values())
+
+    # Confidence level label
+    if total_score >= 80:
+        level = "very_high"
+    elif total_score >= 60:
+        level = "high"
+    elif total_score >= 40:
+        level = "medium"
+    elif total_score >= 20:
+        level = "low"
+    else:
+        level = "very_low"
+
+    return {
+        "score": round(total_score, 0),
+        "level": level,
+        "components": components,
+    }
+
+
+def _calculate_head_to_head_probability(
+    player_a: dict[str, Any],
+    player_b: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Estimate probability that player A outscores player B in the next gameweek.
+
+    Uses expected points as baseline, adjusted by:
+    - Confidence scores (more certain projections get more weight)
+    - Recent form variance (inconsistent players have wider outcome distributions)
+
+    Returns dict with probability breakdown.
+    """
+    # Get expected points
+    xpts_a = player_a.get("expected_points", 0.0)
+    xpts_b = player_b.get("expected_points", 0.0)
+
+    # Get confidence scores (default to medium if not present)
+    conf_a = player_a.get("confidence", {}).get("score", 50) / 100
+    conf_b = player_b.get("confidence", {}).get("score", 50) / 100
+
+    # Get form variance proxy from signals
+    signals_a = player_a.get("signals", {})
+    signals_b = player_b.get("signals", {})
+
+    # Higher playing probability = more predictable
+    play_prob_a = signals_a.get("playing_probability", 0.75)
+    play_prob_b = signals_b.get("playing_probability", 0.75)
+
+    # Estimate standard deviation based on expected points and confidence
+    # Lower confidence or lower playing prob = higher uncertainty
+    # Typical FPL std dev is ~2-4 points per game
+    base_std = 3.0
+    std_a = base_std * (1.5 - (conf_a * 0.5)) * (1.5 - (play_prob_a * 0.5))
+    std_b = base_std * (1.5 - (conf_b * 0.5)) * (1.5 - (play_prob_b * 0.5))
+
+    # Using simplified probability calculation:
+    # P(A > B) where A ~ N(μ_a, σ_a²) and B ~ N(μ_b, σ_b²)
+    # A - B ~ N(μ_a - μ_b, σ_a² + σ_b²)
+    # P(A > B) = P(A - B > 0) = Φ((μ_a - μ_b) / sqrt(σ_a² + σ_b²))
+    import math
+
+    mean_diff = xpts_a - xpts_b
+    combined_std = math.sqrt(std_a**2 + std_b**2)
+
+    # Standard normal CDF approximation
+    if combined_std < 0.001:
+        # Avoid division by zero
+        prob_a_wins = 0.5 if abs(mean_diff) < 0.001 else (1.0 if mean_diff > 0 else 0.0)
+    else:
+        z = mean_diff / combined_std
+        # Approximation of standard normal CDF
+        prob_a_wins = 0.5 * (1 + math.erf(z / math.sqrt(2)))
+
+    # Calculate expected points advantage
+    xpts_diff = round(xpts_a - xpts_b, 2)
+
+    # Confidence in the comparison
+    comparison_confidence = round((conf_a + conf_b) / 2 * 100, 0)
+
+    # Determine recommendation strength
+    if prob_a_wins >= 0.7:
+        recommendation = "strongly_prefer_a"
+    elif prob_a_wins >= 0.55:
+        recommendation = "slightly_prefer_a"
+    elif prob_a_wins <= 0.3:
+        recommendation = "strongly_prefer_b"
+    elif prob_a_wins <= 0.45:
+        recommendation = "slightly_prefer_b"
+    else:
+        recommendation = "toss_up"
+
+    return {
+        "player_a_id": player_a.get("id"),
+        "player_b_id": player_b.get("id"),
+        "player_a_name": player_a.get("name"),
+        "player_b_name": player_b.get("name"),
+        "prob_a_outscores_b": round(prob_a_wins * 100, 1),
+        "prob_b_outscores_a": round((1 - prob_a_wins) * 100, 1),
+        "xpts_difference": xpts_diff,
+        "comparison_confidence": comparison_confidence,
+        "recommendation": recommendation,
+    }
+
+
+def _calculate_outcome_range(
+    el: dict[str, Any],
+    expected_points: float,
+    playing_probability: float,
+    confidence_score: float,
+) -> dict[str, Any]:
+    """
+    Calculate floor, ceiling, and haul probability for a player.
+
+    Uses expected points and variance estimation to project outcome ranges.
+
+    Returns dict with floor (10th percentile), ceiling (90th percentile),
+    and probability of haul (10+ points).
+    """
+    import math
+
+    pos = POS_MAP.get(int(el.get("element_type", 3)), "MID")
+
+    # Base standard deviation varies by position
+    # Attackers more volatile, defenders more consistent
+    position_volatility = {
+        "GKP": 2.5,  # Lower variance - mostly 2-6 points
+        "DEF": 3.0,  # Moderate variance - clean sheet dependent
+        "MID": 3.5,  # Higher variance - goal involvements vary
+        "FWD": 4.0,  # Highest variance - feast or famine
+    }
+    base_std = position_volatility.get(pos, 3.5)
+
+    # Adjust standard deviation based on confidence
+    # Lower confidence = wider range of outcomes
+    confidence_factor = 1.5 - (confidence_score / 100 * 0.5)  # 1.0 to 1.5
+    adjusted_std = base_std * confidence_factor
+
+    # Account for playing probability - not playing = 0 points
+    # This creates a bimodal distribution but we'll approximate
+
+    # Floor (10th percentile)
+    # If playing_prob < 0.9, floor could be 0 (doesn't play)
+    if playing_probability < 0.5:
+        floor = 0.0
+    elif playing_probability < 0.9:
+        # Blend between 0 and statistical floor
+        stat_floor = max(0, expected_points - 1.28 * adjusted_std)
+        floor = stat_floor * (playing_probability - 0.5) / 0.4
+    else:
+        floor = max(0, expected_points - 1.28 * adjusted_std)
+
+    # Ceiling (90th percentile)
+    ceiling = expected_points + 1.28 * adjusted_std
+
+    # Haul probability (10+ points)
+    # P(X >= 10) = 1 - Phi((10 - μ) / σ)
+    if adjusted_std > 0.001:
+        z_haul = (10 - expected_points) / adjusted_std
+        prob_haul = 0.5 * (1 - math.erf(z_haul / math.sqrt(2)))
+    else:
+        prob_haul = 1.0 if expected_points >= 10 else 0.0
+
+    # Adjust haul probability by playing probability
+    prob_haul *= playing_probability
+
+    # Blank probability (2 or fewer points, i.e., didn't start or no returns)
+    if adjusted_std > 0.001:
+        z_blank = (2 - expected_points) / adjusted_std
+        prob_blank_if_plays = 0.5 * (1 + math.erf(z_blank / math.sqrt(2)))
+    else:
+        prob_blank_if_plays = 1.0 if expected_points <= 2 else 0.0
+
+    # Account for not playing as a blank
+    prob_blank = prob_blank_if_plays * playing_probability + (1 - playing_probability)
+
+    return {
+        "floor": round(floor, 1),
+        "ceiling": round(ceiling, 1),
+        "haul_probability": round(prob_haul * 100, 1),
+        "blank_probability": round(prob_blank * 100, 1),
+        "expected_range": f"{round(floor, 1)}-{round(ceiling, 1)}",
+    }
+
+
+def _calculate_form_trajectory(
+    history: list[dict[str, Any]],
+    recent_matches: int = 5,
+) -> dict[str, Any]:
+    """
+    Analyze form trajectory to detect hot/cold streaks.
+
+    Compares recent performance vs season average to identify:
+    - Hot streaks (significantly outperforming season average)
+    - Cold streaks (significantly underperforming)
+    - Heating up (improving trend)
+    - Cooling down (declining trend)
+
+    Args:
+        history: Player match history from element-summary
+        recent_matches: How many recent matches to consider
+
+    Returns dict with trajectory analysis.
+    """
+    if not history or len(history) < 3:
+        return {
+            "trajectory": "insufficient_data",
+            "trend": None,
+            "streak": None,
+            "recent_vs_season": None,
+        }
+
+    # Get season totals
+    season_pts = sum(int(_to_float(h.get("total_points", 0))) for h in history)
+    season_mins = sum(int(_to_float(h.get("minutes", 0))) for h in history)
+    season_ppg = season_pts / len(history) if history else 0
+
+    # Get recent matches
+    recent = history[-min(recent_matches, len(history)):]
+    recent_pts = sum(int(_to_float(h.get("total_points", 0))) for h in recent)
+    recent_mins = sum(int(_to_float(h.get("minutes", 0))) for h in recent)
+    recent_ppg = recent_pts / len(recent) if recent else 0
+
+    # Performance ratio: recent vs season
+    perf_ratio = recent_ppg / season_ppg if season_ppg > 0 else 1.0
+
+    # Calculate trend: compare first half of recent vs second half
+    if len(recent) >= 4:
+        mid = len(recent) // 2
+        first_half_ppg = sum(int(_to_float(h.get("total_points", 0))) for h in recent[:mid]) / mid
+        second_half_ppg = sum(int(_to_float(h.get("total_points", 0))) for h in recent[mid:]) / (len(recent) - mid)
+        trend_ratio = second_half_ppg / first_half_ppg if first_half_ppg > 0 else 1.0
+    else:
+        trend_ratio = 1.0
+
+    # Detect streaks (consecutive good or bad games)
+    streak_count = 0
+    streak_type = None
+    for h in reversed(recent):
+        pts = int(_to_float(h.get("total_points", 0)))
+        if pts >= 6:  # Good game
+            if streak_type is None:
+                streak_type = "returns"
+            elif streak_type == "returns":
+                streak_count += 1
+            else:
+                break
+        elif pts <= 2:  # Blank
+            if streak_type is None:
+                streak_type = "blanks"
+            elif streak_type == "blanks":
+                streak_count += 1
+            else:
+                break
+        else:
+            break
+
+    streak = None
+    if streak_count >= 2 and streak_type:
+        streak = f"{streak_count + 1}_consecutive_{streak_type}"
+
+    # Determine trajectory label
+    if perf_ratio >= 1.3 and trend_ratio >= 1.0:
+        trajectory = "hot_streak"
+    elif perf_ratio >= 1.15 or trend_ratio >= 1.2:
+        trajectory = "heating_up"
+    elif perf_ratio <= 0.7 and trend_ratio <= 1.0:
+        trajectory = "cold_streak"
+    elif perf_ratio <= 0.85 or trend_ratio <= 0.8:
+        trajectory = "cooling_down"
+    else:
+        trajectory = "stable"
+
+    # Check for big haul recently
+    recent_max = max(int(_to_float(h.get("total_points", 0))) for h in recent) if recent else 0
+    has_recent_haul = recent_max >= 10
+
+    return {
+        "trajectory": trajectory,
+        "recent_ppg": round(recent_ppg, 2),
+        "season_ppg": round(season_ppg, 2),
+        "performance_vs_season": round((perf_ratio - 1) * 100, 1),  # % above/below season avg
+        "trend": "improving" if trend_ratio >= 1.15 else ("declining" if trend_ratio <= 0.85 else "steady"),
+        "trend_strength": round((trend_ratio - 1) * 100, 1),
+        "streak": streak,
+        "recent_max_points": recent_max,
+        "has_recent_haul": has_recent_haul,
+        "matches_analyzed": len(recent),
+    }
+
+
+def _fixture_congestion_factor(
+    fixtures: list[dict[str, Any]],
+    team_id: int,
+    target_event: int,
+    window: int = 3,
+) -> float:
+    """
+    Calculate a congestion multiplier based on fixture density around target_event.
+
+    Returns multiplier (0.9-1.0) where lower values indicate higher congestion
+    and potential for rotation/fatigue.
+
+    Args:
+        fixtures: Full fixtures list
+        team_id: Team to check
+        target_event: The gameweek to analyze
+        window: How many gameweeks before/after to consider
+
+    Returns:
+        Multiplier between 0.9 (congested) and 1.0 (normal)
+    """
+    event_range = range(target_event - window, target_event + window + 1)
+    fixture_count = 0
+
+    for fx in fixtures:
+        ev = fx.get("event")
+        if ev is None:
+            continue
+        if int(ev) not in event_range:
+            continue
+        if fx.get("team_h") == team_id or fx.get("team_a") == team_id:
+            fixture_count += 1
+
+    # Normal is ~window*2+1 fixtures (one per GW)
+    expected_fixtures = window * 2 + 1
+    congestion_ratio = fixture_count / expected_fixtures if expected_fixtures else 1.0
+
+    # If ratio > 1.2 (20% more fixtures than normal), apply penalty
+    if congestion_ratio > 1.2:
+        # Scale: 1.2 ratio = 0.98, 1.5 ratio = 0.92, 2.0 ratio = 0.90
+        penalty = min(0.10, (congestion_ratio - 1.0) * 0.20)
+        return max(0.90, 1.0 - penalty)
+
+    return 1.0
+
+
+def _availability_penalty(el: dict[str, Any], base_xpts: float | None = None) -> float:
+    """
+    Calculate availability penalty for flagged/injured players.
+
+    If base_xpts is provided, returns a proportional penalty (percentage of base_xpts).
+    Otherwise returns legacy fixed penalties for backward compatibility.
+
+    Proportional mode penalties:
+    - Non-available status: 30% of base_xpts
+    - chance < 75%: additional 20% of base_xpts
+    - chance < 50%: additional 20% of base_xpts (cumulative with above)
+    """
     status = str(el.get("status", "a"))
     chance = el.get("chance_of_playing_next_round", None)
+
+    if base_xpts is not None and base_xpts > 0:
+        # Proportional penalty mode
+        penalty_pct = 0.0
+        if status != "a":
+            penalty_pct += 0.30  # 30% penalty for non-available status
+        if chance is not None:
+            c = _to_float(chance, 100.0)
+            if c < 75:
+                penalty_pct += 0.20  # 20% penalty for low chance
+            if c < 50:
+                penalty_pct += 0.20  # Additional 20% for very low chance
+        return base_xpts * min(penalty_pct, 0.70)  # Cap at 70% of base_xpts
+
+    # Legacy fixed penalty mode for backward compatibility
     penalty = 0.0
     if status != "a":
         penalty += 3.0
@@ -202,7 +829,9 @@ def _availability_penalty(el: dict[str, Any]) -> float:
 
 def _playing_probability(el: dict[str, Any], avg_minutes: float = 90.0) -> float:
     """
-    Estimate probability of playing 60+ minutes based on status, news, and recent minutes.
+    Estimate probability of playing any minutes based on status, news, and recent minutes.
+    This is NOT a "60+ minutes" probability—it's the chance of appearing at all,
+    adjusted for rotation risk based on avg_minutes.
     Returns 0.0 to 1.0.
     """
     status = str(el.get("status", "a"))
@@ -243,9 +872,15 @@ def _calculate_expected_points(
     is_home: bool,
     playing_prob: float,
     avg_minutes: float,
+    opponent_defense_strength: float | None = None,
 ) -> dict[str, Any]:
     """
     Calculate expected points for a single gameweek using xG/xA and fixture context.
+
+    Args:
+        opponent_defense_strength: Opponent's defensive strength multiplier (1.0 = average).
+            Lower values = weaker defense = better attacking opportunities.
+            If provided, used to further adjust xG/xA output.
 
     Returns breakdown of expected points by category.
     """
@@ -266,8 +901,17 @@ def _calculate_expected_points(
     difficulty_factor = 1.0 + (3.0 - fixture_difficulty) * 0.1  # Range: 0.8 to 1.2
     home_boost = 1.1 if is_home else 1.0
 
-    xg_adj = xg_per_game * difficulty_factor * home_boost
-    xa_adj = xa_per_game * difficulty_factor * home_boost
+    # Adjust for opponent defense strength (if provided)
+    # Lower defense strength = easier to score against
+    # Multiplier: invert so weaker defense (0.8) becomes boost (1.25), stronger defense (1.2) becomes penalty (0.83)
+    opp_defense_factor = 1.0
+    if opponent_defense_strength is not None and opponent_defense_strength > 0:
+        # Dampen the effect to avoid extreme swings (max ±15% adjustment)
+        opp_defense_factor = 1.0 + (1.0 - opponent_defense_strength) * 0.15
+        opp_defense_factor = max(0.85, min(1.15, opp_defense_factor))
+
+    xg_adj = xg_per_game * difficulty_factor * home_boost * opp_defense_factor
+    xa_adj = xa_per_game * difficulty_factor * home_boost * opp_defense_factor
 
     # Expected points from goals and assists
     xpts_goals = xg_adj * coeffs["goal"]
@@ -301,7 +945,9 @@ def _calculate_expected_points(
         saves_per_game = 3.0 * (1.0 + (fixture_difficulty - 3.0) * 0.1)
         xpts_saves = saves_per_game / coeffs.get("saves_per_pt", 3)
 
-    total_xpts = (xpts_goals + xpts_assists + xpts_cs + xpts_minutes + xpts_bonus + xpts_saves) * playing_prob
+    # Apply playing_prob to all components EXCEPT minutes (which already has it baked in)
+    xpts_from_play = (xpts_goals + xpts_assists + xpts_cs + xpts_bonus + xpts_saves) * playing_prob
+    total_xpts = xpts_from_play + xpts_minutes
 
     return {
         "expected_points": round(total_xpts, 2),
@@ -309,7 +955,7 @@ def _calculate_expected_points(
             "xpts_goals": round(xpts_goals * playing_prob, 3),
             "xpts_assists": round(xpts_assists * playing_prob, 3),
             "xpts_clean_sheet": round(xpts_cs * playing_prob, 3),
-            "xpts_minutes": round(xpts_minutes, 3),
+            "xpts_minutes": round(xpts_minutes, 3),  # Already includes playing_prob
             "xpts_bonus": round(xpts_bonus * playing_prob, 3),
             "xpts_saves": round(xpts_saves * playing_prob, 3),
         },
@@ -317,6 +963,7 @@ def _calculate_expected_points(
             "playing_probability": round(playing_prob, 3),
             "fixture_difficulty": fixture_difficulty,
             "difficulty_factor": round(difficulty_factor, 3),
+            "opponent_defense_factor": round(opp_defense_factor, 3),
             "is_home": is_home,
             "xg_per_game": round(xg_per_game, 3),
             "xa_per_game": round(xa_per_game, 3),
@@ -331,15 +978,23 @@ def _calculate_multi_gw_xpts(
     current_event: int | None,
     horizon_gws: int,
     avg_minutes: float = 90.0,
+    team_strength: dict[int, dict[str, float]] | None = None,
 ) -> dict[str, Any]:
     """
     Calculate expected points over multiple gameweeks.
+
+    Args:
+        team_strength: Optional dict of team_id -> strength metrics from _calculate_team_strength.
+            If provided, opponent defensive strength is used to adjust xG/xA.
+
+    Applies fixture congestion factor to reduce expected points during busy periods.
     """
     team_id = int(el["team"])
     playing_prob = _playing_probability(el, avg_minutes)
 
     gw_xpts: list[dict[str, Any]] = []
     total_xpts = 0.0
+    congestion_applied = False
 
     if current_event is not None:
         for fx in fixtures:
@@ -362,21 +1017,42 @@ def _calculate_multi_gw_xpts(
             else:
                 continue
 
-            gw_calc = _calculate_expected_points(el, difficulty, is_home, playing_prob, avg_minutes)
+            # Get opponent defense strength if available
+            opp_defense = None
+            if team_strength and opp_id:
+                opp_strength = team_strength.get(int(opp_id), {})
+                # Use away defense if we're home, home defense if we're away
+                opp_defense = opp_strength.get("defense_away" if is_home else "defense_home")
+
+            # Calculate fixture congestion factor for this gameweek
+            congestion_factor = _fixture_congestion_factor(fixtures, team_id, ev)
+            if congestion_factor < 1.0:
+                congestion_applied = True
+
+            # Adjust playing probability for congestion (rotation risk increases)
+            adjusted_playing_prob = playing_prob * congestion_factor
+
+            gw_calc = _calculate_expected_points(
+                el, difficulty, is_home, adjusted_playing_prob, avg_minutes, opp_defense
+            )
+
+            gw_xpts_value = gw_calc["expected_points"]
             gw_xpts.append({
                 "event": ev,
                 "opponent": teams_by_id.get(int(opp_id), {}).get("name") if opp_id else None,
                 "is_home": is_home,
                 "difficulty": difficulty,
-                "expected_points": gw_calc["expected_points"],
+                "expected_points": gw_xpts_value,
+                "congestion_factor": round(congestion_factor, 3),
             })
-            total_xpts += gw_calc["expected_points"]
+            total_xpts += gw_xpts_value
 
     return {
         "total_expected_points": round(total_xpts, 2),
         "gameweeks": gw_xpts,
         "avg_xpts_per_gw": round(total_xpts / len(gw_xpts), 2) if gw_xpts else 0.0,
         "playing_probability": round(playing_prob, 3),
+        "congestion_adjusted": congestion_applied,
     }
 
 
@@ -448,6 +1124,11 @@ def _can_transfer_in(
     Check if a transfer is valid according to FPL rules.
 
     Returns dict with 'valid' bool and 'reasons' list if invalid.
+
+    NOTE: selling_price defaults to now_cost, but FPL uses the half-profit rule:
+    selling_price = purchase_price + (now_cost - purchase_price) // 2
+    Without access to purchase history, we use now_cost as an approximation.
+    This may overestimate available funds for players who have risen in price.
     """
     reasons: list[str] = []
 
@@ -764,12 +1445,26 @@ def _score_player_first_pass(
     horizon_gws: int,
     current_event: int | None,
     avg_minutes: float | None = None,
+    weights: dict[str, float] | None = None,
+    team_strength: dict[int, dict[str, float]] | None = None,
+    elements: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """
     Score player using expected points model.
 
     Uses xG/xA-based projections adjusted for fixture difficulty.
+
+    Args:
+        weights: Optional dict with keys "xpts", "form", "value" to customize scoring.
+            Defaults: {"xpts": 1.0, "form": 0.3, "value": 0.5}
+        team_strength: Optional dict from _calculate_team_strength for opponent-adjusted xG/xA.
+        elements: Optional list of all elements for team context calculation.
     """
+    # Default weights
+    w = {"xpts": 1.0, "form": 0.3, "value": 0.5}
+    if weights:
+        w.update(weights)
+
     team_id = int(el["team"])
     pos = POS_MAP.get(int(el["element_type"]), "MID")
     price = _price_m(int(el["now_cost"]))
@@ -784,9 +1479,9 @@ def _score_player_first_pass(
     if avg_minutes is None:
         avg_minutes = minutes / games_played if games_played > 1 else 90.0
 
-    # Get multi-gameweek expected points
+    # Get multi-gameweek expected points (with team strength adjustment if available)
     xpts_data = _calculate_multi_gw_xpts(
-        el, fixtures, teams_by_id, current_event, horizon_gws, avg_minutes
+        el, fixtures, teams_by_id, current_event, horizon_gws, avg_minutes, team_strength
     )
 
     total_xpts = xpts_data["total_expected_points"]
@@ -798,11 +1493,11 @@ def _score_player_first_pass(
     # Availability penalty for flagged players
     penalty = _availability_penalty(el)
 
-    # Final score is expected points with minor adjustments
+    # Final score using customizable weights
     # We prioritize xPts but give small boosts for:
     # - Recent form (shows current performance level)
     # - Value (points per million is important for budget)
-    score = total_xpts + (form * 0.3) + (value * 0.5) - penalty
+    score = (total_xpts * w["xpts"]) + (form * w["form"]) + (value * w["value"]) - penalty
 
     team_name = teams_by_id.get(team_id, {}).get("name", str(team_id))
     name = f"{el.get('first_name','')} {el.get('second_name','')}".strip() or str(el.get("web_name"))
@@ -812,7 +1507,43 @@ def _score_player_first_pass(
     xa = _to_float(el.get("expected_assists"))
     xgi = _to_float(el.get("expected_goal_involvements"))
 
-    return {
+    # Actual goals and assists
+    actual_goals = int(_to_float(el.get("goals_scored", 0)))
+    actual_assists = int(_to_float(el.get("assists", 0)))
+
+    # Overperformance/underperformance calculation
+    # Positive = overperforming (scoring above xG, may regress DOWN)
+    # Negative = underperforming (scoring below xG, may regress UP - "buy low" candidate)
+    goal_overperformance = actual_goals - xg
+    assist_overperformance = actual_assists - xa
+    total_overperformance = goal_overperformance + assist_overperformance
+
+    # Determine regression signal
+    if total_overperformance > 1.5:
+        regression_risk = "high_overperformer_regression_risk"
+    elif total_overperformance > 0.5:
+        regression_risk = "slight_overperformer"
+    elif total_overperformance < -1.5:
+        regression_risk = "strong_buy_signal_underperformer"
+    elif total_overperformance < -0.5:
+        regression_risk = "potential_buy_underperformer"
+    else:
+        regression_risk = "performing_as_expected"
+
+    # Calculate confidence score for this projection
+    confidence = _calculate_confidence_score(el, avg_minutes, minutes)
+
+    # Calculate outcome range (floor, ceiling, haul probability)
+    outcome_range = _calculate_outcome_range(
+        el, total_xpts, playing_prob, confidence["score"]
+    )
+
+    # Calculate team attacking context (if elements available)
+    team_context = None
+    if elements and team_strength:
+        team_context = _calculate_team_attacking_context(team_id, team_strength, elements)
+
+    result = {
         "id": int(el["id"]),
         "name": name,
         "team": team_name,
@@ -835,9 +1566,29 @@ def _score_player_first_pass(
             "availability_penalty": penalty,
             "minutes_season": minutes,
             "avg_minutes_per_game": round(avg_minutes, 1),
+            # Actual vs expected
+            "goals_scored": actual_goals,
+            "assists": actual_assists,
+            "goal_overperformance": round(goal_overperformance, 2),
+            "assist_overperformance": round(assist_overperformance, 2),
+            "total_overperformance": round(total_overperformance, 2),
+            "regression_risk": regression_risk,
+            # Shot volume proxies (threat = best proxy for shots/chances in FPL data)
+            "threat": _to_float(el.get("threat", 0)),
+            "threat_per_90": round(_to_float(el.get("threat", 0)) / games_played, 2) if games_played > 0 else 0.0,
+            "creativity": _to_float(el.get("creativity", 0)),
+            "creativity_per_90": round(_to_float(el.get("creativity", 0)) / games_played, 2) if games_played > 0 else 0.0,
+            "influence": _to_float(el.get("influence", 0)),
+            "influence_per_90": round(_to_float(el.get("influence", 0)) / games_played, 2) if games_played > 0 else 0.0,
         },
+        "confidence": confidence,
+        "outcome_range": outcome_range,
+        "team_context": team_context,
         "fixture_xpts": xpts_data["gameweeks"],
     }
+    # Generate explanation after building the result
+    result["explanation"] = _generate_explanation(result)
+    return result
 
 
 def _recent_form_from_element_summary(es: dict[str, Any], last_matches: int) -> dict[str, Any]:
@@ -845,6 +1596,7 @@ def _recent_form_from_element_summary(es: dict[str, Any], last_matches: int) -> 
     Extract recent trend signals from element-summary history.
 
     Works even if some expected fields are missing by falling back safely.
+    Also includes form trajectory analysis (hot/cold detection).
     """
     history: list[dict[str, Any]] = es.get("history", []) or []
     if not history:
@@ -854,6 +1606,7 @@ def _recent_form_from_element_summary(es: dict[str, Any], last_matches: int) -> 
             "points_per_90": 0.0,
             "xgi_per_90": 0.0,
             "blank_rate": None,
+            "form_trajectory": {"trajectory": "insufficient_data"},
         }
 
     last = history[-max(1, min(last_matches, len(history))):]
@@ -880,25 +1633,145 @@ def _recent_form_from_element_summary(es: dict[str, Any], last_matches: int) -> 
     xgi_per_90 = (xgi_sum / mins) * 90.0 if mins > 0 else 0.0
     blank_rate = (blanks / matches_used) if matches_used else None
 
+    # Calculate form trajectory using full history
+    form_trajectory = _calculate_form_trajectory(history, recent_matches=last_matches)
+
     return {
         "matches_used": matches_used,
         "avg_minutes": round(avg_minutes, 2),
         "points_per_90": round(points_per_90, 3),
         "xgi_per_90": round(xgi_per_90, 3),
         "blank_rate": None if blank_rate is None else round(blank_rate, 3),
+        "form_trajectory": form_trajectory,
     }
 
 
-def _refine_score(base: dict[str, Any], recent: dict[str, Any]) -> dict[str, Any]:
+def _generate_explanation(
+    scored: dict[str, Any],
+    recent: dict[str, Any] | None = None,
+) -> str:
+    """
+    Generate a human-readable explanation of why a player scored well/poorly.
+
+    Returns a concise string highlighting key factors.
+    """
+    factors: list[str] = []
+
+    # Expected points assessment
+    xpts = scored.get("expected_points", 0.0)
+    if xpts >= 6.0:
+        factors.append("strong xPts output")
+    elif xpts >= 4.0:
+        factors.append("solid xPts")
+    elif xpts < 2.5:
+        factors.append("low xPts projection")
+
+    # Fixture assessment
+    fixture_xpts = scored.get("fixture_xpts", [])
+    if fixture_xpts:
+        easy_fixtures = sum(1 for f in fixture_xpts if f.get("difficulty", 3) <= 2)
+        hard_fixtures = sum(1 for f in fixture_xpts if f.get("difficulty", 3) >= 4)
+        if easy_fixtures >= len(fixture_xpts) * 0.6:
+            factors.append("favorable fixtures")
+        elif hard_fixtures >= len(fixture_xpts) * 0.6:
+            factors.append("difficult fixture run")
+
+    # Signals assessment
+    signals = scored.get("signals", {})
+    form = signals.get("form", 0.0)
+    if form >= 7.0:
+        factors.append("excellent form")
+    elif form >= 5.0:
+        factors.append("good form")
+    elif form < 3.0 and form > 0:
+        factors.append("poor recent form")
+
+    value = signals.get("value_xpts_per_million", 0.0)
+    if value >= 1.5:
+        factors.append("great value")
+    elif value >= 1.0:
+        factors.append("good value")
+
+    penalty = signals.get("availability_penalty", 0.0)
+    if penalty > 2.0:
+        factors.append("injury/availability concern")
+    elif penalty > 0:
+        factors.append("minor doubt flag")
+
+    playing_prob = signals.get("playing_probability", 1.0)
+    if playing_prob < 0.7:
+        factors.append("rotation risk")
+
+    # Overperformance/underperformance signals
+    regression_risk = signals.get("regression_risk", "")
+    if regression_risk == "high_overperformer_regression_risk":
+        factors.append("CAUTION: overperforming xG, regression likely")
+    elif regression_risk == "strong_buy_signal_underperformer":
+        factors.append("BUY SIGNAL: underperforming xG, due for goals")
+    elif regression_risk == "potential_buy_underperformer":
+        factors.append("underperforming xG slightly")
+
+    # Recent trends (if available from refinement)
+    if recent:
+        avg_mins = recent.get("avg_minutes", 0.0)
+        if avg_mins >= 80:
+            factors.append("nailed starter")
+        elif avg_mins < 60 and avg_mins > 0:
+            factors.append("minutes concern")
+
+        xgi90 = recent.get("xgi_per_90", 0.0)
+        if xgi90 >= 0.6:
+            factors.append("elite xGI/90")
+        elif xgi90 >= 0.4:
+            factors.append("strong underlying stats")
+
+        blank_rate = recent.get("blank_rate")
+        if blank_rate is not None and blank_rate > 0.5:
+            factors.append("recent blank streak")
+
+    if not factors:
+        return "Average profile across key metrics"
+
+    return "; ".join(factors)
+
+
+def _refine_score(
+    base: dict[str, Any],
+    recent: dict[str, Any],
+    weights: dict[str, float] | None = None,
+) -> dict[str, Any]:
     """
     Second-pass adjustment:
     - Reward: recent xGI/90, recent points/90, strong minutes trend
     - Penalise: low average minutes (rotation risk)
+    - Apply Bayesian shrinkage to per-90 stats for low-minutes players
+
+    Args:
+        weights: Optional dict with keys "xgi90", "p90" to customize scoring.
+            Defaults: {"xgi90": 2.2, "p90": 0.9}
     """
+    # Default weights
+    w = {"xgi90": 2.2, "p90": 0.9}
+    if weights:
+        w.update(weights)
+
     base_score = float(base.get("base_score", 0.0))
     avg_minutes = float(recent.get("avg_minutes", 0.0))
-    p90 = float(recent.get("points_per_90", 0.0))
-    xgi90 = float(recent.get("xgi_per_90", 0.0))
+    p90_raw = float(recent.get("points_per_90", 0.0))
+    xgi90_raw = float(recent.get("xgi_per_90", 0.0))
+
+    # Apply Bayesian shrinkage to per-90 stats based on season minutes
+    # This regresses stats toward position mean for low-sample players
+    position = base.get("position", "MID")
+    season_minutes = base.get("signals", {}).get("minutes_season", 0)
+
+    shrunk_stats = _shrink_per90_stats(
+        {"xgi": xgi90_raw, "points": p90_raw},
+        minutes=season_minutes,
+        position=position,
+    )
+    xgi90 = shrunk_stats.get("xgi", xgi90_raw)
+    p90 = shrunk_stats.get("points", p90_raw)
 
     minutes_factor = min(avg_minutes / 90.0, 1.0)
     rotation_pen = 0.0
@@ -909,8 +1782,8 @@ def _refine_score(base: dict[str, Any], recent: dict[str, Any]) -> dict[str, Any
 
     refined = (
         base_score
-        + (xgi90 * 2.2)
-        + (p90 * 0.9)
+        + (xgi90 * w["xgi90"])
+        + (p90 * w["p90"])
         + (minutes_factor * 1.2)
         - rotation_pen
     )
@@ -921,8 +1794,118 @@ def _refine_score(base: dict[str, Any], recent: dict[str, Any]) -> dict[str, Any
     out["adjustments"] = {
         "rotation_penalty": rotation_pen,
         "minutes_factor": round(minutes_factor, 3),
-        "xgi90_weight": 2.2,
-        "p90_weight": 0.9,
+        "xgi90_weight": w["xgi90"],
+        "p90_weight": w["p90"],
+        "shrinkage_applied": season_minutes < 900,
+        "xgi90_raw": round(xgi90_raw, 4),
+        "xgi90_shrunk": round(xgi90, 4),
+        "p90_raw": round(p90_raw, 4),
+        "p90_shrunk": round(p90, 4),
+    }
+    # Update explanation with recent data context
+    out["explanation"] = _generate_explanation(out, recent)
+    return out
+
+
+def _apply_risk_profile(
+    scored: dict[str, Any],
+    risk_level: str,
+    elements_by_id: dict[int, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """
+    Apply risk profile adjustments to a scored player.
+
+    Args:
+        scored: Scored player dict (from first pass or refined)
+        risk_level: "low", "medium", or "high"
+        elements_by_id: Optional dict for looking up ownership data
+
+    Returns:
+        Updated scored dict with risk_adjusted_score
+    """
+    out = dict(scored)
+    base = float(scored.get("refined_score", scored.get("base_score", 0.0)))
+
+    # Get ownership percentage
+    player_id = scored.get("id")
+    ownership_pct = 0.0
+    if elements_by_id and player_id:
+        el = elements_by_id.get(int(player_id), {})
+        ownership_pct = _to_float(el.get("selected_by_percent", 0.0))
+
+    signals = scored.get("signals", {})
+    recent = scored.get("recent_signals", {})
+
+    adjustment = 0.0
+    risk_factors: list[str] = []
+
+    if risk_level == "low":
+        # Prefer proven performers, penalize uncertainty
+        # Bonus for high ownership (template players)
+        if ownership_pct >= 20:
+            adjustment += 0.5
+            risk_factors.append("high_ownership_bonus")
+
+        # Bonus for consistent minutes
+        avg_mins = recent.get("avg_minutes", 0.0) if recent else signals.get("avg_minutes_per_game", 0.0)
+        if avg_mins >= 80:
+            adjustment += 0.8
+            risk_factors.append("nailed_starter_bonus")
+
+        # Penalty for rotation risk
+        playing_prob = signals.get("playing_probability", 1.0)
+        if playing_prob < 0.9:
+            adjustment -= 1.0
+            risk_factors.append("rotation_penalty")
+
+        # Penalty for flagged players
+        availability_penalty = signals.get("availability_penalty", 0.0)
+        if availability_penalty > 0:
+            adjustment -= 1.5
+            risk_factors.append("availability_penalty")
+
+        # Penalty for low minutes sample
+        minutes = signals.get("minutes_season", 0)
+        if minutes < 500:
+            adjustment -= 0.5
+            risk_factors.append("small_sample_penalty")
+
+    elif risk_level == "high":
+        # Prefer differentials and recent outperformers
+        # Bonus for low ownership
+        if ownership_pct <= 5:
+            adjustment += 1.2
+            risk_factors.append("low_ownership_bonus")
+        elif ownership_pct <= 10:
+            adjustment += 0.6
+            risk_factors.append("differential_bonus")
+
+        # Bonus for recent xGI outperformance
+        xgi90 = recent.get("xgi_per_90", 0.0) if recent else 0.0
+        if xgi90 >= 0.5:
+            adjustment += 0.8
+            risk_factors.append("hot_underlying_stats")
+
+        # Bonus for form spike (form > PPG suggests hot streak)
+        form = signals.get("form", 0.0)
+        ppg = signals.get("points_per_game", 0.0)
+        if form > ppg * 1.3 and form >= 5.0:
+            adjustment += 0.6
+            risk_factors.append("form_spike_bonus")
+
+        # Small penalty for template players (already priced in)
+        if ownership_pct >= 30:
+            adjustment -= 0.3
+            risk_factors.append("template_penalty")
+
+    # Medium risk = no adjustment (baseline)
+
+    out["risk_adjusted_score"] = round(base + adjustment, 3)
+    out["risk_profile"] = {
+        "level": risk_level,
+        "adjustment": round(adjustment, 3),
+        "ownership_pct": round(ownership_pct, 1),
+        "factors": risk_factors,
     }
     return out
 
@@ -1052,7 +2035,7 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="fpl_best_players_refined",
-        description="Two-pass rank: quick shortlist (bootstrap+fixtures) then refine with element-summary trends (minutes/points/90/xGI/90).",
+        description="Two-pass rank: quick shortlist (bootstrap+fixtures) then refine with element-summary trends (minutes/points/90/xGI/90). Supports custom scoring weights.",
         inputSchema={
             "type": "object",
             "properties": {
@@ -1065,6 +2048,12 @@ TOOLS: list[Tool] = [
                 "refine_pool": {"type": "integer", "default": 60, "description": "How many top candidates to enrich via element-summary"},
                 "last_matches": {"type": "integer", "default": 5, "description": "Recent matches window for refinement"},
                 "concurrency": {"type": "integer", "default": 8, "description": "Max concurrent element-summary fetches"},
+                "xpts_weight": {"type": "number", "default": 1.0, "description": "Weight for expected points in scoring (default 1.0)"},
+                "form_weight": {"type": "number", "default": 0.3, "description": "Weight for current form (default 0.3)"},
+                "value_weight": {"type": "number", "default": 0.5, "description": "Weight for value (xPts/million) (default 0.5)"},
+                "xgi90_weight": {"type": "number", "default": 2.2, "description": "Weight for recent xGI/90 in refinement (default 2.2)"},
+                "p90_weight": {"type": "number", "default": 0.9, "description": "Weight for recent points/90 in refinement (default 0.9)"},
+                "risk_level": {"type": "string", "enum": ["low", "medium", "high"], "default": "medium", "description": "Risk profile: 'low' favors proven performers, 'high' favors differentials"},
             },
             "required": [],
         },
@@ -1212,6 +2201,26 @@ TOOLS: list[Tool] = [
             "type": "object",
             "properties": {
                 "event_id": {"type": "integer", "description": "Gameweek (defaults to current)"},
+            },
+            "required": [],
+        },
+    ),
+    Tool(
+        name="fpl_player_enriched",
+        description="Deep player analysis with external data from Understat and FBref. Provides shots on target, xG per shot, conversion rate, progressive passes, and more detailed stats than FPL API.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "player_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "FPL player IDs to get enriched data for (1-5 players)",
+                },
+                "player_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Alternative: player names to search and enrich",
+                },
             },
             "required": [],
         },
@@ -1438,6 +2447,19 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         last_matches = int(arguments.get("last_matches", 5))
         concurrency = int(arguments.get("concurrency", 8))
 
+        # Custom scoring weights (for fpl_best_players_refined)
+        xpts_weight = float(arguments.get("xpts_weight", 1.0))
+        form_weight = float(arguments.get("form_weight", 0.3))
+        value_weight = float(arguments.get("value_weight", 0.5))
+        xgi90_weight = float(arguments.get("xgi90_weight", 2.2))
+        p90_weight = float(arguments.get("p90_weight", 0.9))
+        risk_level = str(arguments.get("risk_level", "medium")).lower()
+        if risk_level not in ("low", "medium", "high"):
+            risk_level = "medium"
+
+        first_pass_weights = {"xpts": xpts_weight, "form": form_weight, "value": value_weight}
+        refine_weights = {"xgi90": xgi90_weight, "p90": p90_weight}
+
         bs = await _bootstrap()
         fx = await _fixtures()
 
@@ -1446,6 +2468,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
         elements = bs.get("elements", [])
+        elements_by_id = {int(el["id"]): el for el in elements}
+
+        # Calculate team strength once for opponent-adjusted projections
+        team_strength = _calculate_team_strength(bs.get("teams", []))
 
         pos_filter: Position | None = None
         if isinstance(position, str) and position.strip():
@@ -1467,7 +2493,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 continue
 
             first_pass.append(
-                _score_player_first_pass(el, teams_by_id, fx, horizon_gws=horizon_gws, current_event=current_event)
+                _score_player_first_pass(
+                    el, teams_by_id, fx, horizon_gws=horizon_gws, current_event=current_event,
+                    weights=first_pass_weights, team_strength=team_strength, elements=elements
+                )
             )
 
         first_pass.sort(key=lambda r: r["base_score"], reverse=True)
@@ -1490,13 +2519,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             async with sem:
                 es = await _element_summary(pid)
             recent = _recent_form_from_element_summary(es, last_matches=last_matches)
-            return _refine_score(item, recent)
+            return _refine_score(item, recent, weights=refine_weights)
 
         enriched = await asyncio.gather(*(enrich_one(it) for it in pool))
 
-        # Rank by refined score, then trim to limit
-        enriched.sort(key=lambda r: r.get("refined_score", r.get("base_score", 0.0)), reverse=True)
-        results = enriched[: max(1, limit)]
+        # Apply risk profile adjustments
+        enriched_with_risk = [
+            _apply_risk_profile(item, risk_level, elements_by_id)
+            for item in enriched
+        ]
+
+        # Rank by risk-adjusted score (or refined if no risk adjustment)
+        sort_key = "risk_adjusted_score" if risk_level != "medium" else "refined_score"
+        enriched_with_risk.sort(
+            key=lambda r: r.get(sort_key, r.get("refined_score", r.get("base_score", 0.0))),
+            reverse=True
+        )
+        results = enriched_with_risk[: max(1, limit)]
 
         payload = {
             "method": "two_pass_refined_v1",
@@ -1511,6 +2550,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 "refine_pool": refine_pool,
                 "last_matches": last_matches,
                 "concurrency": concurrency,
+                "risk_level": risk_level,
+            },
+            "weights": {
+                "xpts_weight": xpts_weight,
+                "form_weight": form_weight,
+                "value_weight": value_weight,
+                "xgi90_weight": xgi90_weight,
+                "p90_weight": p90_weight,
             },
             "results": results,
         }
@@ -1687,6 +2734,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         fixtures = await _fixtures()
 
+        # Calculate team strength for opponent-adjusted projections
+        team_strength = _calculate_team_strength(bs.get("teams", []))
+
         # Get bank value
         bank = _price_m(int(manager_info.get("last_deadline_bank", 0)))
 
@@ -1701,10 +2751,15 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         # Score all current squad players
         squad_scored: list[dict[str, Any]] = []
+        squad_xpts_by_id: dict[int, float] = {}  # For quick lookup
         for pid in current_squad_ids:
             el = elements_by_id.get(pid, {})
-            scored = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws, current_event)
+            scored = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws, current_event, team_strength=team_strength, elements=elements)
             squad_scored.append(scored)
+            squad_xpts_by_id[int(scored["id"])] = scored["expected_points"]
+
+        # Calculate total team expected points before any transfer
+        team_xpts_before = sum(squad_xpts_by_id.values())
 
         # Sort by expected points (ascending) to find weakest players
         squad_scored.sort(key=lambda x: x["expected_points"])
@@ -1757,7 +2812,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     continue
 
                 # Score the incoming player
-                scored_in = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws, current_event)
+                scored_in = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws, current_event, team_strength=team_strength, elements=elements)
 
                 # Calculate improvement
                 xpts_gain = scored_in["expected_points"] - player_out["expected_points"]
@@ -1767,6 +2822,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                     continue
 
                 seen_transfers.add((out_id, in_id))
+
+                # Calculate team-level impact
+                team_xpts_after = team_xpts_before - player_out["expected_points"] + scored_in["expected_points"]
+
                 suggestions.append({
                     "out": {
                         "id": out_id,
@@ -1796,6 +2855,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                         "within_budget": True,
                         "team_limit_ok": True,
                     },
+                    "team_impact": {
+                        "team_xpts_before": round(team_xpts_before, 2),
+                        "team_xpts_after": round(team_xpts_after, 2),
+                        "net_team_delta": round(team_xpts_after - team_xpts_before, 2),
+                    },
                 })
 
         # Sort by expected points gain
@@ -1806,12 +2870,14 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             "current_event": current_event,
             "bank": bank,
             "squad_validation": squad_validation,
+            "squad_total_xpts": round(team_xpts_before, 2),
             "fpl_rules": {
                 "max_per_team": MAX_PLAYERS_PER_TEAM,
                 "squad_composition": SQUAD_COMPOSITION,
             },
             "suggestions": suggestions[:max_transfers],
             "note": "All suggestions respect FPL rules: same position, max 3 per team, and budget constraints.",
+            "disclaimer": "Selling prices use current value (now_cost) as approximation. FPL uses half-profit rule which may reduce actual selling price for players who have risen.",
         }
         return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
 
@@ -1896,6 +2962,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         events = bs.get("events", [])
         current_event = _current_event_id(events)
         fixtures = await _fixtures()
+        team_strength = _calculate_team_strength(bs.get("teams", []))
 
         pos_filter: str | None = None
         if position:
@@ -1925,7 +2992,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             if max_price_m is not None and price > float(max_price_m):
                 continue
 
-            scored = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws=5, current_event=current_event)
+            scored = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws=5, current_event=current_event, team_strength=team_strength, elements=elements)
             scored["ownership_pct"] = ownership
             differentials.append(scored)
 
@@ -2120,10 +3187,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         bs = await _bootstrap()
         teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
-        elements_by_id = {int(el["id"]): el for el in bs.get("elements", [])}
+        elements = bs.get("elements", [])
+        elements_by_id = {int(el["id"]): el for el in elements}
         events = bs.get("events", [])
         current_event = _current_event_id(events)
         fixtures = await _fixtures()
+        team_strength = _calculate_team_strength(bs.get("teams", []))
 
         sem = asyncio.Semaphore(6)
 
@@ -2137,7 +3206,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
             team_id = int(el["team"])
             recent = _recent_form_from_element_summary(es, last_matches=last_matches)
-            scored = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws=5, current_event=current_event)
+            scored = _score_player_first_pass(el, teams_by_id, fixtures, horizon_gws=5, current_event=current_event, team_strength=team_strength, elements=elements)
 
             upcoming = es.get("fixtures", [])[:5]
             upcoming_simple = []
@@ -2170,14 +3239,27 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 },
                 "recent": recent,
                 "base_score": scored["base_score"],
+                "expected_points": scored.get("expected_points", 0.0),
+                "confidence": scored.get("confidence", {}),
+                "signals": scored.get("signals", {}),
                 "upcoming_fixtures": upcoming_simple,
                 "status": el.get("status"),
+                "explanation": scored.get("explanation", ""),
             }
 
         results = await asyncio.gather(*(fetch_player(int(pid)) for pid in player_ids))
 
+        # Generate head-to-head probability comparisons for all pairs
+        head_to_head = []
+        valid_results = [r for r in results if "error" not in r]
+        for i in range(len(valid_results)):
+            for j in range(i + 1, len(valid_results)):
+                h2h = _calculate_head_to_head_probability(valid_results[i], valid_results[j])
+                head_to_head.append(h2h)
+
         payload = {
             "comparison": results,
+            "head_to_head": head_to_head,
             "params": {"player_ids": player_ids, "last_matches": last_matches},
         }
         return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
@@ -2357,6 +3439,90 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         payload = {
             "event_id": event_id,
             "fixtures": fixture_bps,
+        }
+        return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
+
+    if name == "fpl_player_enriched":
+        player_ids = arguments.get("player_ids", [])
+        player_names = arguments.get("player_names", [])
+
+        if not player_ids and not player_names:
+            return [TextContent(type="text", text=json.dumps({"error": "Provide player_ids or player_names"}))]
+
+        bs = await _bootstrap()
+        teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
+        elements_by_id = {int(el["id"]): el for el in bs.get("elements", [])}
+
+        # Resolve player_names to IDs if provided
+        if player_names and not player_ids:
+            player_ids = []
+            for name_query in player_names[:5]:  # Limit to 5
+                q = name_query.lower().strip()
+                for el in bs.get("elements", []):
+                    fn = str(el.get("first_name", "")).lower()
+                    sn = str(el.get("second_name", "")).lower()
+                    wn = str(el.get("web_name", "")).lower()
+                    if q in fn or q in sn or q in wn or q == wn:
+                        player_ids.append(int(el["id"]))
+                        break
+
+        if not player_ids:
+            return [TextContent(type="text", text=json.dumps({"error": "No players found"}))]
+
+        # Limit to 5 players to avoid slow responses
+        player_ids = player_ids[:5]
+
+        results = []
+        for pid in player_ids:
+            el = elements_by_id.get(pid)
+            if el is None:
+                results.append({"id": pid, "error": "Player not found"})
+                continue
+
+            team_id = int(el["team"])
+            team_name = teams_by_id.get(team_id, {}).get("name", "")
+            player_name = f"{el.get('first_name', '')} {el.get('second_name', '')}".strip()
+            web_name = el.get("web_name", "")
+
+            # Get enriched data from external sources
+            try:
+                enriched = await enrich_player_async(player_name, team_name)
+            except Exception as e:
+                logger.warning(f"Enrichment failed for {player_name}: {e}")
+                enriched = {"enrichment_available": False, "error": str(e)}
+
+            # Combine FPL data with enriched data
+            result = {
+                "id": pid,
+                "name": player_name,
+                "web_name": web_name,
+                "team": team_name,
+                "position": POS_MAP.get(int(el["element_type"]), "MID"),
+                "price_m": round(_price_m(int(el["now_cost"])), 1),
+                # FPL stats
+                "fpl_stats": {
+                    "total_points": int(_to_float(el.get("total_points"))),
+                    "points_per_game": _to_float(el.get("points_per_game")),
+                    "minutes": int(_to_float(el.get("minutes"))),
+                    "goals": int(_to_float(el.get("goals_scored"))),
+                    "assists": int(_to_float(el.get("assists"))),
+                    "xG": _to_float(el.get("expected_goals")),
+                    "xA": _to_float(el.get("expected_assists")),
+                    "xGI": _to_float(el.get("expected_goal_involvements")),
+                    "form": _to_float(el.get("form")),
+                    "ict_index": _to_float(el.get("ict_index")),
+                    "threat": _to_float(el.get("threat")),
+                    "creativity": _to_float(el.get("creativity")),
+                    "influence": _to_float(el.get("influence")),
+                },
+                # External enriched data
+                "enriched": enriched,
+            }
+            results.append(result)
+
+        payload = {
+            "players": results,
+            "sources_note": "External data from Understat (xG per shot, conversion rate) and FBref (SOT, progressive passes). Data is cached for 6 hours.",
         }
         return [TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))]
 

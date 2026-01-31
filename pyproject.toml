@@ -11,4 +11,9 @@ dependencies = [
     "pydantic>=2.12.5",
     "python-dotenv>=1.2.1",
     "uvicorn>=0.38.0",
+    # External data enrichment
+    "understatapi>=0.6.0",
+    "soccerdata>=1.0.0",
+    # Redis for enrichment caching
+    "redis>=5.0.0",
 ]
