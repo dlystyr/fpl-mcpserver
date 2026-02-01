@@ -651,25 +651,31 @@ async def list_tools() -> list[Tool]:
         # ===== TEAM ANALYSIS TOOLS (2) =====
         Tool(
             name="analyze_my_team",
-            description="Full analysis of your FPL team - weaknesses, suggestions, projected points",
+            description="Full analysis of YOUR FPL team - weaknesses, suggestions, projected points. Automatically fetches your squad from FPL API using your manager ID from the SSE URL. No parameters needed!",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "team_ids": {"type": "array", "items": {"type": "integer"}},
+                    "team_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional: List of player IDs. If not provided, auto-fetches from FPL API."
+                    },
                     "budget_remaining": {"type": "number", "default": 0}
-                },
-                "required": ["team_ids"]
+                }
             }
         ),
         Tool(
             name="get_team_weaknesses",
-            description="Identify weak spots in your team that need addressing",
+            description="Identify weak spots in YOUR team that need addressing. Automatically fetches your squad from FPL API. No parameters needed!",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "team_ids": {"type": "array", "items": {"type": "integer"}}
-                },
-                "required": ["team_ids"]
+                    "team_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Optional: List of player IDs. If not provided, auto-fetches from FPL API."
+                    }
+                }
             }
         ),
 
@@ -1577,10 +1583,32 @@ async def tool_analyze_my_team(args: dict) -> dict:
     from optimization.captaincy import get_captaincy_picks
 
     team_ids = args.get("team_ids", [])
-    if not team_ids:
-        return {"error": "Team IDs required"}
-
     budget_remaining = args.get("budget_remaining", 0)
+
+    # If no team_ids provided, fetch from FPL API using session team_id
+    if not team_ids:
+        manager_id = _get_team_id(args)
+        if not manager_id:
+            return {
+                "error": "No team_ids provided and no manager ID configured",
+                "hint": "Either provide team_ids (list of player IDs) or configure your manager ID in the SSE URL (?team=YOUR_ID)"
+            }
+
+        # Fetch current picks from FPL API
+        gameweek = await _get_current_gameweek()
+        if not gameweek:
+            return {"error": "Could not determine current gameweek"}
+
+        picks_data = await _fetch_fpl_api(f"entry/{manager_id}/event/{gameweek}/picks/")
+        if not picks_data:
+            return {"error": f"Could not fetch picks for manager {manager_id}"}
+
+        team_ids = [p["element"] for p in picks_data.get("picks", [])]
+        entry_history = picks_data.get("entry_history", {})
+        budget_remaining = entry_history.get("bank", 0) / 10
+
+        if not team_ids:
+            return {"error": "No players found in your team"}
 
     # Get player data
     placeholders = ", ".join(f"${i+1}" for i in range(len(team_ids)))
@@ -1658,8 +1686,27 @@ async def tool_get_team_weaknesses(args: dict) -> dict:
     from optimization.transfers import get_transfer_suggestions
 
     team_ids = args.get("team_ids", [])
+
+    # If no team_ids provided, fetch from FPL API using session team_id
     if not team_ids:
-        return {"error": "Team IDs required"}
+        manager_id = _get_team_id(args)
+        if not manager_id:
+            return {
+                "error": "No team_ids provided and no manager ID configured",
+                "hint": "Either provide team_ids or configure your manager ID in the SSE URL"
+            }
+
+        gameweek = await _get_current_gameweek()
+        if not gameweek:
+            return {"error": "Could not determine current gameweek"}
+
+        picks_data = await _fetch_fpl_api(f"entry/{manager_id}/event/{gameweek}/picks/")
+        if not picks_data:
+            return {"error": f"Could not fetch picks for manager {manager_id}"}
+
+        team_ids = [p["element"] for p in picks_data.get("picks", [])]
+        if not team_ids:
+            return {"error": "No players found in your team"}
 
     placeholders = ", ".join(f"${i+1}" for i in range(len(team_ids)))
     players = await fetch_all(f"""
@@ -2445,6 +2492,7 @@ class MessagesHandler:
     """ASGI handler for MCP messages."""
 
     async def __call__(self, scope, receive, send):
+        logger.info("Messages endpoint called")
         await sse.handle_post_message(scope, receive, send)
 
 
