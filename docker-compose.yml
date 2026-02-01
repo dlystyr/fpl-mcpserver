@@ -28,7 +28,8 @@ services:
       POSTGRES_USER: fpl
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fplpass}
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      # PostgreSQL 18+ uses /var/lib/postgresql (not /data subdirectory)
+      - postgres-data:/var/lib/postgresql
       - ./init-db:/docker-entrypoint-initdb.d:ro
     ports:
       - "5432:5432"
@@ -64,7 +65,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.mcp
-    image: fpl-mcp:latest
     container_name: fpl-mcp
     ports:
       - "${PORT:-8000}:8000"
@@ -97,7 +97,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.sync
-    image: fpl-sync:latest
     profiles:
       - sync  # Only runs when explicitly called
     environment:
