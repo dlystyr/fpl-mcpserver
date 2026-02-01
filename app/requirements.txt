@@ -11,3 +11,8 @@ pulp>=2.7.0
 # External data enrichment
 understatapi>=0.6.0
 soccerdata>=1.0.0
+# Visualization
+plotly>=5.18.0
+kaleido>=0.2.1
+numpy>=1.26.0
+pandas>=2.1.0

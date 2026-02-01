@@ -1,10 +1,13 @@
-"""FPLOracle MCP Server - 36 tools for ultimate FPL domination."""
+"""FPLOracle MCP Server - 41 tools for ultimate FPL domination."""
 
 import json
 import logging
+from contextvars import ContextVar
+from urllib.parse import parse_qs
+import httpx
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
-from mcp.types import Tool, TextContent
+from mcp.types import Tool, TextContent, ImageContent, Prompt, PromptMessage, PromptArgument
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -21,13 +24,233 @@ from enrichment import enrich_player_async
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Session context - stores team_id from SSE query params
+session_team_id: ContextVar[int | None] = ContextVar("session_team_id", default=None)
+
 mcp = Server("FPLOracle")
 sse = SseServerTransport("/messages/")
+
+# FPL API base URL
+FPL_API_BASE = "https://fantasy.premierleague.com/api"
 
 POSITION_MAP = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
 
 
-# === MCP Tools Definition (35 tools) ===
+# === MCP Prompts (System Instructions) ===
+
+SYSTEM_PROMPT = """You are FPLOracle, an expert Fantasy Premier League assistant powered by live data.
+
+## Critical Rules
+
+1. **Data Source Priority**: The FPL Bootstrap API data is your source of truth for:
+   - Player prices, ownership, form, and points
+   - Team information and fixtures
+   - Gameweek deadlines and status
+   - Player availability and news
+
+   NEVER rely on your training data for current FPL information - it is outdated.
+
+2. **Always Verify Before Advising**: Before making any transfer, captaincy, or team suggestions:
+   - Use the tools to fetch current data
+   - Check player availability status (injured, suspended, doubtful)
+   - Verify fixture difficulty ratings
+   - Consider recent form (last 5 gameweeks)
+   - enrich player data with the tool fpl_player_enriched
+
+3. **Price Accuracy**: Player prices change daily based on transfers. Always fetch current prices.
+
+4. **Fixture Awareness**:
+   - Double Gameweeks (DGW) and Blank Gameweeks (BGW) significantly impact strategy
+   - Use get_dgw_bgw_outlook to check for special gameweeks
+   - FDR (Fixture Difficulty Rating) ranges from 1 (easiest) to 5 (hardest)
+
+5. **Expected Stats Context**:
+   - xG (expected goals) and xA (expected assists) indicate underlying performance
+   - Players outperforming xG may regress; underperformers may improve
+   - Use analyze_luck and get_overperformers/get_underperformers tools
+
+6. **Transfer Rules**:
+   - Maximum 3 players from any single team
+   - Squad: 2 GK, 5 DEF, 5 MID, 3 FWD (15 total)
+   - Selling price uses half-profit rule (not full purchase price)
+   - -4 point hit per extra transfer beyond free transfers
+
+7. **Chip Strategy**:
+   - Wildcard: Unlimited free transfers for one gameweek
+   - Free Hit: Temporary team for one gameweek only
+   - Bench Boost: Points from all 15 players count
+   - Triple Captain: Captain gets 3x points instead of 2x
+
+8. **Current Season Context**: We are in the 2025-26 Premier League season.
+
+## Response Style
+- Be specific with player names and prices
+- Quote actual statistics from the tools
+- Explain the reasoning behind recommendations
+- Acknowledge uncertainty when data is limited
+"""
+
+FPL_RULES_PROMPT = """## FPL Game Rules Reference
+
+### Squad Composition
+- 15 players total: 2 GK, 5 DEF, 5 MID, 3 FWD
+- Maximum 3 players from any single Premier League team
+- Starting 11 must have: 1 GK, minimum 3 DEF, minimum 1 FWD
+
+### Budget
+- Starting budget: 100.0m
+- Player prices fluctuate based on transfer activity
+- Selling price = purchase price + floor((current price - purchase price) / 2)
+
+### Points Scoring
+**Appearance**: 1pt (1-59 mins), 2pts (60+ mins)
+**Goals**: GK/DEF 6pts, MID 5pts, FWD 4pts
+**Assists**: 3pts
+**Clean Sheet**: GK/DEF 4pts, MID 1pt
+**Saves**: 1pt per 3 saves (GK only)
+**Penalty Save**: 5pts
+**Penalty Miss**: -2pts
+**Yellow Card**: -1pt
+**Red Card**: -3pts
+**Own Goal**: -2pts
+**Bonus Points**: 1-3pts to best performers in each match
+
+### Transfers
+- 1 free transfer per gameweek (max 5 banked with new rules)
+- Additional transfers cost -4 points each
+- Unlimited transfers on Wildcard
+
+### Chips (one use per season, except Wildcard x2)
+- **Wildcard**: Unlimited free transfers, resets team value
+- **Free Hit**: Temporary squad for one GW, reverts after
+- **Bench Boost**: All 15 players score points
+- **Triple Captain**: Captain scores 3x points
+"""
+
+
+@mcp.list_prompts()
+async def list_prompts() -> list[Prompt]:
+    """List available prompts for LLM guidance."""
+    return [
+        Prompt(
+            name="fpl-oracle-system",
+            description="System instructions for FPLOracle - use this to understand how to interact with FPL data correctly",
+            arguments=[]
+        ),
+        Prompt(
+            name="fpl-rules",
+            description="Complete FPL game rules reference - scoring, transfers, chips, squad composition",
+            arguments=[]
+        ),
+        Prompt(
+            name="analyze-team",
+            description="Structured prompt for analyzing a user's FPL team",
+            arguments=[
+                PromptArgument(
+                    name="team_ids",
+                    description="Comma-separated list of player IDs in the user's team",
+                    required=True
+                ),
+                PromptArgument(
+                    name="budget_remaining",
+                    description="Remaining budget in millions (e.g., 2.5)",
+                    required=False
+                )
+            ]
+        ),
+        Prompt(
+            name="transfer-advice",
+            description="Structured prompt for transfer recommendations",
+            arguments=[
+                PromptArgument(
+                    name="player_out",
+                    description="Name or ID of player to transfer out",
+                    required=True
+                ),
+                PromptArgument(
+                    name="budget",
+                    description="Maximum budget for replacement in millions",
+                    required=False
+                )
+            ]
+        ),
+    ]
+
+
+@mcp.get_prompt()
+async def get_prompt(name: str, arguments: dict | None = None) -> list[PromptMessage]:
+    """Return prompt content."""
+    args = arguments or {}
+
+    if name == "fpl-oracle-system":
+        return [
+            PromptMessage(
+                role="user",
+                content=TextContent(type="text", text=SYSTEM_PROMPT)
+            )
+        ]
+
+    elif name == "fpl-rules":
+        return [
+            PromptMessage(
+                role="user",
+                content=TextContent(type="text", text=FPL_RULES_PROMPT)
+            )
+        ]
+
+    elif name == "analyze-team":
+        team_ids = args.get("team_ids", "")
+        budget = args.get("budget_remaining", "0")
+        return [
+            PromptMessage(
+                role="user",
+                content=TextContent(type="text", text=f"""Analyze my FPL team comprehensively.
+
+My team player IDs: {team_ids}
+Remaining budget: {budget}m
+
+Please:
+1. Use analyze_my_team tool to get full analysis
+2. Identify any injured/doubtful players using player status
+3. Check fixture difficulty for my players' teams
+4. Suggest captain picks for the upcoming gameweek
+5. Identify any obvious weaknesses or upgrade opportunities
+6. Check if any players are overperforming their xG (regression risk)
+
+{SYSTEM_PROMPT}""")
+            )
+        ]
+
+    elif name == "transfer-advice":
+        player_out = args.get("player_out", "")
+        budget = args.get("budget", "")
+        budget_text = f" with a maximum budget of {budget}m" if budget else ""
+        return [
+            PromptMessage(
+                role="user",
+                content=TextContent(type="text", text=f"""I want to transfer out {player_out}{budget_text}.
+
+Please:
+1. First check {player_out}'s current stats, form, and upcoming fixtures
+2. Use get_transfer_suggestions to find replacements
+3. Compare the top 3 alternatives using compare_players
+4. Check fixture difficulty for each option
+5. Consider ownership % for differential potential
+6. Make a final recommendation with reasoning
+
+{SYSTEM_PROMPT}""")
+            )
+        ]
+
+    return [
+        PromptMessage(
+            role="user",
+            content=TextContent(type="text", text=f"Unknown prompt: {name}")
+        )
+    ]
+
+
+# === MCP Tools Definition (41 tools) ===
 
 @mcp.list_tools()
 async def list_tools() -> list[Tool]:
@@ -460,12 +683,123 @@ async def list_tools() -> list[Tool]:
                 }
             }
         ),
+
+        # ===== VISUALIZATION TOOLS (2) =====
+        Tool(
+            name="fpl_player_radar",
+            description="Generate a radar chart comparing players across key metrics (xG, xA, form, points, ownership, ICT). Returns an image. Compare 2-4 players.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "player_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of 2-4 player IDs to compare"
+                    },
+                    "player_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Alternative: list of player names to compare"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["image", "svg", "both"],
+                        "default": "image",
+                        "description": "Output format: image (PNG), svg, or both"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="fpl_form_chart",
+            description="Generate a line chart showing player form/points over recent gameweeks. Compare 1-4 players.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "player_ids": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "List of 1-4 player IDs"
+                    },
+                    "player_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Alternative: list of player names"
+                    },
+                    "metric": {
+                        "type": "string",
+                        "enum": ["points", "form", "xG", "xA", "minutes"],
+                        "default": "points",
+                        "description": "Metric to chart over time"
+                    },
+                    "gameweeks": {
+                        "type": "integer",
+                        "default": 10,
+                        "description": "Number of gameweeks to show"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["image", "svg", "both"],
+                        "default": "image"
+                    }
+                }
+            }
+        ),
+
+        # ===== MY TEAM TOOLS (3) - Uses team_id from SSE URL =====
+        Tool(
+            name="fpl_my_team",
+            description="Get YOUR FPL team info (overall rank, points, transfers, chips used). Uses team_id from SSE connection URL (?team=123456). Can override with team_id param to view other managers.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_id": {
+                        "type": "integer",
+                        "description": "Optional: Override team ID to view a different manager"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="fpl_my_picks",
+            description="Get YOUR FPL picks for a specific gameweek (starting 11, bench, captain, vice-captain, chips played). Uses team_id from SSE connection URL.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "gameweek": {
+                        "type": "integer",
+                        "description": "Gameweek number (defaults to current)"
+                    },
+                    "team_id": {
+                        "type": "integer",
+                        "description": "Optional: Override team ID"
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="fpl_my_history",
+            description="Get YOUR FPL season history (gameweek-by-gameweek points, rank, transfers, bench points). Uses team_id from SSE connection URL.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "team_id": {
+                        "type": "integer",
+                        "description": "Optional: Override team ID"
+                    }
+                }
+            }
+        ),
     ]
 
 
 @mcp.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageContent]:
     try:
+        # Visualization tools return mixed content directly
+        if name in ("fpl_player_radar", "fpl_form_chart"):
+            return await handle_visualization_tool(name, arguments)
+
         result = await handle_tool(name, arguments)
         # Handle dataclass results
         if hasattr(result, '__dataclass_fields__'):
@@ -562,6 +896,14 @@ async def handle_tool(name: str, args: dict) -> dict:
     # === Enrichment Tool ===
     elif name == "fpl_player_enriched":
         return await tool_fpl_player_enriched(args)
+
+    # === My Team Tools (FPL API) ===
+    elif name == "fpl_my_team":
+        return await tool_fpl_my_team(args)
+    elif name == "fpl_my_picks":
+        return await tool_fpl_my_picks(args)
+    elif name == "fpl_my_history":
+        return await tool_fpl_my_history(args)
 
     return {"error": f"Unknown tool: {name}"}
 
@@ -1459,11 +1801,625 @@ async def tool_fpl_player_enriched(args: dict) -> dict:
     }
 
 
+# ===== VISUALIZATION TOOLS IMPLEMENTATION =====
+
+async def handle_visualization_tool(name: str, args: dict) -> list[TextContent | ImageContent]:
+    """Handle visualization tools that return images."""
+    if name == "fpl_player_radar":
+        return await tool_fpl_player_radar(args)
+    elif name == "fpl_form_chart":
+        return await tool_fpl_form_chart(args)
+    return [TextContent(type="text", text=json.dumps({"error": f"Unknown visualization: {name}"}))]
+
+
+async def _resolve_player_ids(player_ids: list | None, player_names: list | None) -> list[int]:
+    """Resolve player names to IDs if needed."""
+    if player_ids:
+        return player_ids
+
+    if not player_names:
+        return []
+
+    resolved = []
+    for name in player_names:
+        row = await fetch_one("SELECT id FROM players WHERE web_name ILIKE $1 LIMIT 1", f"%{name}%")
+        if row:
+            resolved.append(row["id"])
+    return resolved
+
+
+async def _get_players_for_chart(player_ids: list[int]) -> list[dict]:
+    """Fetch player data for charting."""
+    if not player_ids:
+        return []
+
+    placeholders = ", ".join(f"${i+1}" for i in range(len(player_ids)))
+    players = await fetch_all(f"""
+        SELECT p.id, p.web_name, p.element_type, p.now_cost, p.form,
+               p.total_points, p.goals_scored, p.assists, p.minutes,
+               p.expected_goals, p.expected_assists, p.ict_index,
+               p.selected_by_percent, t.short_name as team
+        FROM players p
+        JOIN teams t ON p.team_id = t.id
+        WHERE p.id IN ({placeholders})
+    """, *player_ids)
+    return list(players)
+
+
+def _generate_radar_chart(players: list[dict], output_format: str = "image") -> dict:
+    """Generate radar chart comparing players using Plotly."""
+    import plotly.graph_objects as go
+    import numpy as np
+    import base64
+
+    # Define metrics for radar
+    categories = ['Form', 'Points/Game', 'xG', 'xA', 'ICT Index', 'Ownership']
+
+    # Normalize data for each player (0-100 scale)
+    def normalize(values, max_vals):
+        return [min(100, (v / m * 100)) if m > 0 else 0 for v, m in zip(values, max_vals)]
+
+    # Calculate max values for normalization
+    max_vals = [
+        max(float(p.get("form") or 0) for p in players) or 10,
+        max((p.get("total_points") or 0) / max((p.get("minutes") or 1) / 90, 1) for p in players) or 10,
+        max(float(p.get("expected_goals") or 0) for p in players) or 5,
+        max(float(p.get("expected_assists") or 0) for p in players) or 5,
+        max(float(p.get("ict_index") or 0) for p in players) or 100,
+        max(float(p.get("selected_by_percent") or 0) for p in players) or 50,
+    ]
+
+    # Color palette
+    colors = ['#636EFA', '#EF553B', '#00CC96', '#AB63FA']
+
+    fig = go.Figure()
+
+    for i, player in enumerate(players):
+        minutes = max(player.get("minutes") or 1, 1)
+        nineties = minutes / 90
+
+        raw_values = [
+            float(player.get("form") or 0),
+            (player.get("total_points") or 0) / max(nineties, 1),
+            float(player.get("expected_goals") or 0),
+            float(player.get("expected_assists") or 0),
+            float(player.get("ict_index") or 0),
+            float(player.get("selected_by_percent") or 0),
+        ]
+
+        normalized = normalize(raw_values, max_vals)
+        # Close the radar by repeating first value
+        normalized.append(normalized[0])
+        cats = categories + [categories[0]]
+
+        fig.add_trace(go.Scatterpolar(
+            r=normalized,
+            theta=cats,
+            fill='toself',
+            fillcolor=f'rgba{tuple(list(int(colors[i % len(colors)].lstrip("#")[j:j+2], 16) for j in (0, 2, 4)) + [0.25])}',
+            line=dict(color=colors[i % len(colors)], width=2),
+            name=f"{player['web_name']} ({player['team']})",
+            hovertemplate=(
+                f"<b>{player['web_name']}</b><br>"
+                "Form: %{customdata[0]:.1f}<br>"
+                "Pts/90: %{customdata[1]:.1f}<br>"
+                "xG: %{customdata[2]:.2f}<br>"
+                "xA: %{customdata[3]:.2f}<br>"
+                "ICT: %{customdata[4]:.1f}<br>"
+                "Own%: %{customdata[5]:.1f}%<extra></extra>"
+            ),
+            customdata=[raw_values] * len(cats)
+        ))
+
+    fig.update_layout(
+        polar=dict(
+            radialaxis=dict(
+                visible=True,
+                range=[0, 100],
+                showticklabels=False,
+                ticks='',
+            ),
+            angularaxis=dict(
+                tickfont=dict(size=12, color='#333'),
+            ),
+            bgcolor='rgba(255,255,255,0.9)',
+        ),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.2,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=11)
+        ),
+        title=dict(
+            text="Player Comparison Radar",
+            font=dict(size=16, color='#333'),
+            x=0.5
+        ),
+        paper_bgcolor='white',
+        margin=dict(l=80, r=80, t=80, b=80),
+        width=600,
+        height=500,
+    )
+
+    result = {}
+
+    if output_format in ("image", "both"):
+        # Generate PNG
+        img_bytes = fig.to_image(format="png", scale=2)
+        result["image_base64"] = base64.b64encode(img_bytes).decode()
+
+    if output_format in ("svg", "both"):
+        # Generate SVG
+        result["svg"] = fig.to_image(format="svg").decode()
+
+    return result
+
+
+def _generate_form_chart(players: list[dict], snapshots_by_player: dict, metric: str, output_format: str = "image") -> dict:
+    """Generate line chart showing player performance over gameweeks."""
+    import plotly.graph_objects as go
+    import base64
+
+    colors = ['#636EFA', '#EF553B', '#00CC96', '#AB63FA']
+
+    metric_labels = {
+        "points": "Points",
+        "form": "Form",
+        "xG": "Expected Goals",
+        "xA": "Expected Assists",
+        "minutes": "Minutes"
+    }
+
+    fig = go.Figure()
+
+    for i, player in enumerate(players):
+        snapshots = snapshots_by_player.get(player["id"], [])
+        if not snapshots:
+            continue
+
+        # Sort by gameweek
+        snapshots = sorted(snapshots, key=lambda x: x.get("gameweek", 0))
+
+        gws = [s.get("gameweek") for s in snapshots]
+
+        # Extract metric values
+        if metric == "points":
+            values = [s.get("total_points", 0) for s in snapshots]
+        elif metric == "form":
+            values = [float(s.get("form") or 0) for s in snapshots]
+        elif metric == "xG":
+            values = [float(s.get("expected_goals") or 0) for s in snapshots]
+        elif metric == "xA":
+            values = [float(s.get("expected_assists") or 0) for s in snapshots]
+        elif metric == "minutes":
+            values = [s.get("minutes", 0) for s in snapshots]
+        else:
+            values = [s.get("total_points", 0) for s in snapshots]
+
+        fig.add_trace(go.Scatter(
+            x=gws,
+            y=values,
+            mode='lines+markers',
+            name=f"{player['web_name']} ({player['team']})",
+            line=dict(color=colors[i % len(colors)], width=3),
+            marker=dict(size=8, color=colors[i % len(colors)]),
+            hovertemplate=f"<b>{player['web_name']}</b><br>GW%{{x}}: %{{y:.1f}}<extra></extra>"
+        ))
+
+    fig.update_layout(
+        title=dict(
+            text=f"Player {metric_labels.get(metric, metric)} Over Time",
+            font=dict(size=16, color='#333'),
+            x=0.5
+        ),
+        xaxis=dict(
+            title="Gameweek",
+            tickmode='linear',
+            tick0=1,
+            dtick=1,
+            gridcolor='rgba(0,0,0,0.1)',
+        ),
+        yaxis=dict(
+            title=metric_labels.get(metric, metric),
+            gridcolor='rgba(0,0,0,0.1)',
+        ),
+        showlegend=True,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.25,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=11)
+        ),
+        paper_bgcolor='white',
+        plot_bgcolor='rgba(250,250,250,1)',
+        margin=dict(l=60, r=40, t=60, b=80),
+        width=700,
+        height=400,
+    )
+
+    result = {}
+
+    if output_format in ("image", "both"):
+        img_bytes = fig.to_image(format="png", scale=2)
+        result["image_base64"] = base64.b64encode(img_bytes).decode()
+
+    if output_format in ("svg", "both"):
+        result["svg"] = fig.to_image(format="svg").decode()
+
+    return result
+
+
+async def tool_fpl_player_radar(args: dict) -> list[TextContent | ImageContent]:
+    """Generate radar chart comparing players."""
+    player_ids = await _resolve_player_ids(args.get("player_ids"), args.get("player_names"))
+
+    if len(player_ids) < 2:
+        return [TextContent(type="text", text=json.dumps({"error": "Need at least 2 players to compare"}))]
+    if len(player_ids) > 4:
+        player_ids = player_ids[:4]  # Limit to 4 players
+
+    players = await _get_players_for_chart(player_ids)
+    if len(players) < 2:
+        return [TextContent(type="text", text=json.dumps({"error": "Could not find enough players"}))]
+
+    output_format = args.get("format", "image")
+
+    try:
+        chart_data = _generate_radar_chart(players, output_format)
+    except Exception as e:
+        logger.error(f"Radar chart generation failed: {e}", exc_info=True)
+        return [TextContent(type="text", text=json.dumps({"error": f"Chart generation failed: {e}"}))]
+
+    result = []
+
+    # Build text summary
+    summary_lines = ["**Player Comparison:**"]
+    for p in players:
+        minutes = max(p.get("minutes") or 1, 1)
+        pts_per_90 = (p.get("total_points") or 0) / (minutes / 90)
+        summary_lines.append(
+            f"- **{p['web_name']}** ({p['team']}): Form {p.get('form', 0)}, "
+            f"Pts/90: {pts_per_90:.1f}, xG: {float(p.get('expected_goals') or 0):.2f}, "
+            f"xA: {float(p.get('expected_assists') or 0):.2f}"
+        )
+
+    # Add image if generated
+    if "image_base64" in chart_data:
+        result.append(ImageContent(
+            type="image",
+            data=chart_data["image_base64"],
+            mimeType="image/png"
+        ))
+
+    # Add SVG as text if generated
+    if "svg" in chart_data:
+        summary_lines.append("\n**SVG Chart:**")
+        summary_lines.append(chart_data["svg"])
+
+    result.append(TextContent(type="text", text="\n".join(summary_lines)))
+
+    return result
+
+
+async def tool_fpl_form_chart(args: dict) -> list[TextContent | ImageContent]:
+    """Generate line chart showing player performance over gameweeks."""
+    player_ids = await _resolve_player_ids(args.get("player_ids"), args.get("player_names"))
+
+    if not player_ids:
+        return [TextContent(type="text", text=json.dumps({"error": "No players specified"}))]
+    if len(player_ids) > 4:
+        player_ids = player_ids[:4]
+
+    players = await _get_players_for_chart(player_ids)
+    if not players:
+        return [TextContent(type="text", text=json.dumps({"error": "Could not find players"}))]
+
+    metric = args.get("metric", "points")
+    num_gws = args.get("gameweeks", 10)
+    output_format = args.get("format", "image")
+
+    # Fetch snapshots for each player
+    snapshots_by_player = {}
+    for player in players:
+        snapshots = await fetch_all("""
+            SELECT gameweek, form, total_points, expected_goals, expected_assists, minutes
+            FROM player_snapshots
+            WHERE player_id = $1
+            ORDER BY gameweek DESC
+            LIMIT $2
+        """, player["id"], num_gws)
+        snapshots_by_player[player["id"]] = list(snapshots)
+
+    try:
+        chart_data = _generate_form_chart(players, snapshots_by_player, metric, output_format)
+    except Exception as e:
+        logger.error(f"Form chart generation failed: {e}", exc_info=True)
+        return [TextContent(type="text", text=json.dumps({"error": f"Chart generation failed: {e}"}))]
+
+    result = []
+
+    # Build text summary
+    metric_labels = {"points": "Points", "form": "Form", "xG": "xG", "xA": "xA", "minutes": "Minutes"}
+    summary_lines = [f"**{metric_labels.get(metric, metric)} Trend:**"]
+    for p in players:
+        snaps = snapshots_by_player.get(p["id"], [])
+        if snaps:
+            latest = snaps[0] if snaps else {}
+            summary_lines.append(
+                f"- **{p['web_name']}**: Current {metric_labels.get(metric, metric)}: "
+                f"{latest.get(metric, latest.get('total_points', 'N/A'))}"
+            )
+
+    if "image_base64" in chart_data:
+        result.append(ImageContent(
+            type="image",
+            data=chart_data["image_base64"],
+            mimeType="image/png"
+        ))
+
+    if "svg" in chart_data:
+        summary_lines.append("\n**SVG Chart:**")
+        summary_lines.append(chart_data["svg"])
+
+    result.append(TextContent(type="text", text="\n".join(summary_lines)))
+
+    return result
+
+
+# ===== MY TEAM TOOLS IMPLEMENTATION (FPL API) =====
+
+def _get_team_id(args: dict) -> int | None:
+    """Get team_id from args or session context."""
+    # Explicit override takes priority
+    if args.get("team_id"):
+        return args["team_id"]
+    # Fall back to session context from SSE URL
+    return session_team_id.get()
+
+
+async def _fetch_fpl_api(endpoint: str) -> dict | None:
+    """Fetch data from FPL API."""
+    url = f"{FPL_API_BASE}/{endpoint}"
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(url, headers={
+                "User-Agent": "FPLOracle/1.0"
+            })
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as e:
+        logger.error(f"FPL API error: {e.response.status_code} for {url}")
+        return None
+    except Exception as e:
+        logger.error(f"FPL API request failed: {e}")
+        return None
+
+
+async def _get_current_gameweek() -> int | None:
+    """Get the current gameweek number."""
+    data = await _fetch_fpl_api("bootstrap-static/")
+    if not data:
+        return None
+    for event in data.get("events", []):
+        if event.get("is_current"):
+            return event.get("id")
+    return None
+
+
+async def tool_fpl_my_team(args: dict) -> dict:
+    """Get FPL manager info from the official API."""
+    team_id = _get_team_id(args)
+
+    if not team_id:
+        return {
+            "error": "No team ID configured",
+            "hint": "Add ?team=YOUR_TEAM_ID to your SSE connection URL, e.g., https://your-server/sse?team=2866423",
+            "how_to_find": "Your team ID is in your FPL URL: fantasy.premierleague.com/entry/YOUR_ID/event/1"
+        }
+
+    data = await _fetch_fpl_api(f"entry/{team_id}/")
+    if not data:
+        return {"error": f"Could not fetch team {team_id}. Check the team ID is correct."}
+
+    # Extract useful info
+    return {
+        "team_id": team_id,
+        "manager": f"{data.get('player_first_name', '')} {data.get('player_last_name', '')}",
+        "team_name": data.get("name"),
+        "region": data.get("player_region_name"),
+        "started_event": data.get("started_event"),
+        "current_event": data.get("current_event"),
+        "summary_overall_points": data.get("summary_overall_points"),
+        "summary_overall_rank": data.get("summary_overall_rank"),
+        "summary_event_points": data.get("summary_event_points"),
+        "summary_event_rank": data.get("summary_event_rank"),
+        "last_deadline_bank": data.get("last_deadline_bank", 0) / 10,  # Convert to millions
+        "last_deadline_value": data.get("last_deadline_value", 0) / 10,
+        "last_deadline_total_transfers": data.get("last_deadline_total_transfers"),
+        "leagues": {
+            "classic": [
+                {"name": l.get("name"), "rank": l.get("entry_rank")}
+                for l in data.get("leagues", {}).get("classic", [])[:5]
+            ]
+        }
+    }
+
+
+async def tool_fpl_my_picks(args: dict) -> dict:
+    """Get FPL picks for a specific gameweek."""
+    team_id = _get_team_id(args)
+
+    if not team_id:
+        return {
+            "error": "No team ID configured",
+            "hint": "Add ?team=YOUR_TEAM_ID to your SSE connection URL"
+        }
+
+    gameweek = args.get("gameweek")
+    if not gameweek:
+        gameweek = await _get_current_gameweek()
+        if not gameweek:
+            return {"error": "Could not determine current gameweek"}
+
+    data = await _fetch_fpl_api(f"entry/{team_id}/event/{gameweek}/picks/")
+    if not data:
+        return {"error": f"Could not fetch picks for team {team_id} GW{gameweek}"}
+
+    picks = data.get("picks", [])
+    entry_history = data.get("entry_history", {})
+
+    # Get player details from our database
+    player_ids = [p["element"] for p in picks]
+    placeholders = ", ".join(f"${i+1}" for i in range(len(player_ids)))
+    players = await fetch_all(f"""
+        SELECT p.id, p.web_name, p.element_type, p.now_cost, t.short_name as team
+        FROM players p JOIN teams t ON p.team_id = t.id
+        WHERE p.id IN ({placeholders})
+    """, *player_ids)
+    player_map = {p["id"]: p for p in players}
+
+    # Build picks with details
+    starting_11 = []
+    bench = []
+    captain_id = None
+    vice_captain_id = None
+
+    for pick in picks:
+        player = player_map.get(pick["element"], {})
+        pick_info = {
+            "id": pick["element"],
+            "name": player.get("web_name", f"Player {pick['element']}"),
+            "team": player.get("team", "?"),
+            "position": POSITION_MAP.get(player.get("element_type"), "?"),
+            "multiplier": pick["multiplier"],
+            "is_captain": pick["is_captain"],
+            "is_vice_captain": pick["is_vice_captain"],
+        }
+
+        if pick["is_captain"]:
+            captain_id = pick["element"]
+        if pick["is_vice_captain"]:
+            vice_captain_id = pick["element"]
+
+        if pick["position"] <= 11:
+            starting_11.append(pick_info)
+        else:
+            bench.append(pick_info)
+
+    return {
+        "team_id": team_id,
+        "gameweek": gameweek,
+        "active_chip": data.get("active_chip"),
+        "starting_11": starting_11,
+        "bench": bench,
+        "captain": player_map.get(captain_id, {}).get("web_name") if captain_id else None,
+        "vice_captain": player_map.get(vice_captain_id, {}).get("web_name") if vice_captain_id else None,
+        "event_transfers": entry_history.get("event_transfers", 0),
+        "event_transfers_cost": entry_history.get("event_transfers_cost", 0),
+        "points": entry_history.get("points"),
+        "total_points": entry_history.get("total_points"),
+        "overall_rank": entry_history.get("overall_rank"),
+        "bank": entry_history.get("bank", 0) / 10,
+        "value": entry_history.get("value", 0) / 10,
+    }
+
+
+async def tool_fpl_my_history(args: dict) -> dict:
+    """Get FPL season history for a manager."""
+    team_id = _get_team_id(args)
+
+    if not team_id:
+        return {
+            "error": "No team ID configured",
+            "hint": "Add ?team=YOUR_TEAM_ID to your SSE connection URL"
+        }
+
+    data = await _fetch_fpl_api(f"entry/{team_id}/history/")
+    if not data:
+        return {"error": f"Could not fetch history for team {team_id}"}
+
+    current_season = data.get("current", [])
+    past_seasons = data.get("past", [])
+    chips = data.get("chips", [])
+
+    # Format current season GW-by-GW
+    gw_history = []
+    for gw in current_season:
+        gw_history.append({
+            "gameweek": gw.get("event"),
+            "points": gw.get("points"),
+            "total_points": gw.get("total_points"),
+            "rank": gw.get("rank"),
+            "overall_rank": gw.get("overall_rank"),
+            "bank": gw.get("bank", 0) / 10,
+            "value": gw.get("value", 0) / 10,
+            "transfers": gw.get("event_transfers"),
+            "transfers_cost": gw.get("event_transfers_cost"),
+            "points_on_bench": gw.get("points_on_bench"),
+        })
+
+    # Chips used
+    chips_used = [
+        {"name": c.get("name"), "gameweek": c.get("event")}
+        for c in chips
+    ]
+
+    return {
+        "team_id": team_id,
+        "gameweek_history": gw_history,
+        "chips_used": chips_used,
+        "chips_remaining": _get_remaining_chips(chips_used),
+        "past_seasons": [
+            {
+                "season": s.get("season_name"),
+                "total_points": s.get("total_points"),
+                "rank": s.get("rank"),
+            }
+            for s in past_seasons
+        ],
+    }
+
+
+def _get_remaining_chips(chips_used: list) -> list:
+    """Calculate which chips are still available."""
+    all_chips = {"wildcard", "freehit", "bboost", "3xc"}  # FPL chip names
+    used = {c["name"] for c in chips_used}
+    # Wildcard can be used twice (once per half of season)
+    wildcard_count = sum(1 for c in chips_used if c["name"] == "wildcard")
+    remaining = list(all_chips - used)
+    if wildcard_count < 2:
+        remaining.append("wildcard")
+    return remaining
+
+
 # === HTTP Routes ===
 
 async def handle_sse(request: Request):
-    async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
-        await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
+    # Parse team_id from query params: /sse?team=123456
+    team_id = None
+    query_string = request.scope.get("query_string", b"").decode()
+    if query_string:
+        params = parse_qs(query_string)
+        team_param = params.get("team", [None])[0]
+        if team_param:
+            try:
+                team_id = int(team_param)
+                logger.info(f"Session team_id set to {team_id}")
+            except ValueError:
+                logger.warning(f"Invalid team_id in query: {team_param}")
+
+    # Set the session context variable
+    token = session_team_id.set(team_id)
+    try:
+        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+            await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
+    finally:
+        session_team_id.reset(token)
 
 
 async def handle_messages(request: Request):
@@ -1471,7 +2427,7 @@ async def handle_messages(request: Request):
 
 
 async def health_check(request: Request):
-    return JSONResponse({"status": "ok", "server": "FPLOracle", "tools": 36})
+    return JSONResponse({"status": "ok", "server": "FPLOracle", "tools": 41})
 
 
 # === Auth Middleware ===
@@ -1500,7 +2456,7 @@ class APIKeyMiddleware:
 async def startup():
     logger.info("=" * 60)
     logger.info("Starting FPLOracle MCP Server...")
-    logger.info("36 tools available for ultimate FPL domination")
+    logger.info("41 tools available for ultimate FPL domination")
     logger.info("=" * 60)
     await init_db()
     if await init_cache():
