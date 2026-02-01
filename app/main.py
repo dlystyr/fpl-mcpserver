@@ -1,4 +1,4 @@
-"""FPL Fantasy God MCP Server - 35+ tools for ultimate FPL domination."""
+"""FPLOracle MCP Server - 36 tools for ultimate FPL domination."""
 
 import json
 import logging
@@ -16,11 +16,12 @@ from dataclasses import asdict
 from config import get_settings
 from database import init_db, close_db, fetch_all, fetch_one
 from cache import init_cache, close_cache, populate_cache_from_db, cache_get_all_players, cache_get_player
+from enrichment import enrich_player_async
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-mcp = Server("fpl-fantasy-god")
+mcp = Server("FPLOracle")
 sse = SseServerTransport("/messages/")
 
 POSITION_MAP = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
@@ -446,6 +447,19 @@ async def list_tools() -> list[Tool]:
                 "required": ["team_ids"]
             }
         ),
+
+        # ===== ENRICHMENT TOOL (1) =====
+        Tool(
+            name="fpl_player_enriched",
+            description="Get enriched player stats from Understat (xG, xA, shots, key passes) and FBref (SOT, progressive passes, passes into penalty area). Returns advanced analytics not available in FPL.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "player_id": {"type": "integer", "description": "FPL player ID"},
+                    "name": {"type": "string", "description": "Player name (alternative to ID)"}
+                }
+            }
+        ),
     ]
 
 
@@ -544,6 +558,10 @@ async def handle_tool(name: str, args: dict) -> dict:
         return await tool_analyze_my_team(args)
     elif name == "get_team_weaknesses":
         return await tool_get_team_weaknesses(args)
+
+    # === Enrichment Tool ===
+    elif name == "fpl_player_enriched":
+        return await tool_fpl_player_enriched(args)
 
     return {"error": f"Unknown tool: {name}"}
 
@@ -1373,6 +1391,74 @@ async def tool_get_team_weaknesses(args: dict) -> dict:
     }
 
 
+# ===== ENRICHMENT TOOL IMPLEMENTATION =====
+
+async def tool_fpl_player_enriched(args: dict) -> dict:
+    """Get enriched player stats from Understat and FBref."""
+    player_id = args.get("player_id")
+    name = args.get("name")
+
+    # Resolve player
+    if not player_id and name:
+        row = await fetch_one("SELECT id FROM players WHERE web_name ILIKE $1 LIMIT 1", f"%{name}%")
+        player_id = row["id"] if row else None
+
+    if not player_id and not name:
+        return {"error": "Provide either player_id or name"}
+
+    # Get player info for enrichment lookup
+    if player_id:
+        player = await fetch_one("""
+            SELECT p.web_name, p.first_name, p.second_name, t.name as team_name,
+                   p.element_type, p.now_cost, p.form, p.total_points,
+                   p.goals_scored, p.assists, p.expected_goals, p.expected_assists
+            FROM players p JOIN teams t ON p.team_id = t.id WHERE p.id = $1
+        """, player_id)
+    else:
+        player = await fetch_one("""
+            SELECT p.id, p.web_name, p.first_name, p.second_name, t.name as team_name,
+                   p.element_type, p.now_cost, p.form, p.total_points,
+                   p.goals_scored, p.assists, p.expected_goals, p.expected_assists
+            FROM players p JOIN teams t ON p.team_id = t.id
+            WHERE p.web_name ILIKE $1 LIMIT 1
+        """, f"%{name}%")
+        if player:
+            player_id = player["id"]
+
+    if not player:
+        return {"error": f"Player not found: {player_id or name}"}
+
+    # Try different name variants for matching
+    full_name = f"{player['first_name']} {player['second_name']}"
+    web_name = player["web_name"]
+    team_name = player["team_name"]
+
+    # Try full name first, then web_name
+    enriched = await enrich_player_async(full_name, team_name)
+    if not enriched.get("enrichment_available"):
+        enriched = await enrich_player_async(web_name, team_name)
+
+    return {
+        "player": {
+            "id": player_id,
+            "name": web_name,
+            "full_name": full_name,
+            "team": team_name,
+            "position": POSITION_MAP.get(player["element_type"], "?"),
+            "price": player["now_cost"] / 10 if player["now_cost"] else None,
+        },
+        "fpl_stats": {
+            "form": float(player["form"]) if player["form"] else 0,
+            "total_points": player["total_points"],
+            "goals": player["goals_scored"],
+            "assists": player["assists"],
+            "xG": float(player["expected_goals"]) if player["expected_goals"] else 0,
+            "xA": float(player["expected_assists"]) if player["expected_assists"] else 0,
+        },
+        "enrichment": enriched,
+    }
+
+
 # === HTTP Routes ===
 
 async def handle_sse(request: Request):
@@ -1385,7 +1471,7 @@ async def handle_messages(request: Request):
 
 
 async def health_check(request: Request):
-    return JSONResponse({"status": "ok", "server": "fpl-fantasy-god", "tools": 35})
+    return JSONResponse({"status": "ok", "server": "FPLOracle", "tools": 36})
 
 
 # === Auth Middleware ===
@@ -1413,8 +1499,8 @@ class APIKeyMiddleware:
 
 async def startup():
     logger.info("=" * 60)
-    logger.info("Starting FPL Fantasy God MCP Server...")
-    logger.info("35 tools available for ultimate FPL domination")
+    logger.info("Starting FPLOracle MCP Server...")
+    logger.info("36 tools available for ultimate FPL domination")
     logger.info("=" * 60)
     await init_db()
     if await init_cache():
@@ -1422,7 +1508,7 @@ async def startup():
 
 
 async def shutdown():
-    logger.info("Shutting down FPL Fantasy God...")
+    logger.info("Shutting down FPLOracle...")
     await close_cache()
     await close_db()
 
