@@ -76,17 +76,31 @@ async def cache_get(key: str):
         return None
 
 
+def _json_serializer(obj):
+    """Custom JSON serializer for types not supported by default."""
+    from datetime import datetime, date
+    from decimal import Decimal
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, Decimal):
+        return float(obj)
+    return str(obj)
+
+
 async def cache_set(key: str, value, ttl: int = 3600) -> bool:
     """Set JSON value in cache."""
     if not _client:
         return False
     try:
+        # Pre-serialize to handle Decimal, datetime, etc.
+        json_str = json.dumps(value, default=_json_serializer)
         if _has_json_module:
-            await _client.json().set(key, "$", value)
+            # RedisJSON expects a JSON string for the value
+            await _client.execute_command("JSON.SET", key, "$", json_str)
             await _client.expire(key, ttl)
         else:
-            # Standard Redis: serialize to JSON string
-            await _client.set(key, json.dumps(value, default=str), ex=ttl)
+            # Standard Redis
+            await _client.set(key, json_str, ex=ttl)
         return True
     except Exception as e:
         logger.warning(f"Cache set error: {e}")

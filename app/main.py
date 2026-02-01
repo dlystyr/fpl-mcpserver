@@ -797,12 +797,14 @@ async def list_tools() -> list[Tool]:
 
 @mcp.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageContent]:
+    logger.info(f"Tool called: {name} with args: {arguments}")
     try:
         # Visualization tools return mixed content directly
         if name in ("fpl_player_radar", "fpl_form_chart"):
             return await handle_visualization_tool(name, arguments)
 
         result = await handle_tool(name, arguments)
+        logger.info(f"Tool {name} completed successfully")
         # Handle dataclass results
         if hasattr(result, '__dataclass_fields__'):
             result = asdict(result)
