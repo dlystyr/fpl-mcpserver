@@ -2457,48 +2457,35 @@ def _get_remaining_chips(chips_used: list) -> list:
 
 # === HTTP Routes ===
 
-class SSEHandler:
-    """ASGI handler for SSE that properly parses query params."""
-
-    async def __call__(self, scope, receive, send):
-        # Parse team_id from query params: /sse?team=123456
-        team_id = None
-        query_string = scope.get("query_string", b"").decode()
-        if query_string:
-            params = parse_qs(query_string)
-            team_param = params.get("team", [None])[0]
-            if team_param:
-                try:
-                    team_id = int(team_param)
-                    logger.info(f"Session team_id set to {team_id}")
-                except ValueError:
-                    logger.warning(f"Invalid team_id in query: {team_param}")
-
-        # Store in module-level dict and context var
-        session_id = id(scope)
-        if team_id:
-            _session_team_ids[session_id] = team_id
-
-        token = session_team_id.set(team_id)
+async def handle_sse(request: Request):
+    """Handle SSE connections with team_id from query params."""
+    # Parse team_id from query params: /sse?team=123456
+    team_id = None
+    team_param = request.query_params.get("team")
+    if team_param:
         try:
-            async with sse.connect_sse(scope, receive, send) as streams:
-                await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
-        finally:
-            session_team_id.reset(token)
-            _session_team_ids.pop(session_id, None)
+            team_id = int(team_param)
+            logger.info(f"Session team_id set to {team_id}")
+        except ValueError:
+            logger.warning(f"Invalid team_id in query: {team_param}")
+
+    # Store in module-level dict
+    if team_id:
+        _session_team_ids[id(request)] = team_id
+
+    token = session_team_id.set(team_id)
+    try:
+        async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
+            await mcp.run(streams[0], streams[1], mcp.create_initialization_options())
+    finally:
+        session_team_id.reset(token)
+        _session_team_ids.pop(id(request), None)
 
 
-class MessagesHandler:
-    """ASGI handler for MCP messages."""
-
-    async def __call__(self, scope, receive, send):
-        logger.info("Messages endpoint called")
-        await sse.handle_post_message(scope, receive, send)
-
-
-# Create handler instances
-handle_sse_endpoint = SSEHandler()
-handle_messages_endpoint = MessagesHandler()
+async def handle_messages(request: Request):
+    """Handle MCP messages."""
+    logger.info("Messages endpoint called")
+    await sse.handle_post_message(request.scope, request.receive, request._send)
 
 
 async def health_check(request: Request):
@@ -2554,8 +2541,8 @@ app = Starlette(
     routes=[
         Route("/", endpoint=health_check),
         Route("/health", endpoint=health_check),
-        Route("/sse", endpoint=handle_sse_endpoint),
-        Route("/messages/", endpoint=handle_messages_endpoint, methods=["POST"]),
+        Route("/sse", endpoint=handle_sse),
+        Route("/messages/", endpoint=handle_messages, methods=["POST"]),
     ],
     on_startup=[startup],
     on_shutdown=[shutdown],
