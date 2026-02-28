@@ -11,7 +11,8 @@
       "WebFetch(domain:collinb9.github.io)",
       "WebFetch(domain:soccerdata.readthedocs.io)",
       "Bash(uv sync:*)",
-      "Bash(ls -la \"C:\\\\Users\\\\celes\\\\Desktop\\\\Repos\\\\fpl-mcp\\\\fpl-mcpserver\\\\app\\\\analytics\"\" 2>/dev/null || dir \"C:UserscelesDesktopReposfpl-mcpfpl-mcpserverappanalytics \")"
+      "Bash(ls -la \"C:\\\\Users\\\\celes\\\\Desktop\\\\Repos\\\\fpl-mcp\\\\fpl-mcpserver\\\\app\\\\analytics\"\" 2>/dev/null || dir \"C:UserscelesDesktopReposfpl-mcpfpl-mcpserverappanalytics \")",
+      "Bash(ls -la /c/Users/celes/Desktop/Repos/fpl-mcp/fpl-mcpserver/*.py)"
     ]
   }
 }

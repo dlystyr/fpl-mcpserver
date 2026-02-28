@@ -90,6 +90,10 @@ TTL_EVENT_LIVE = int(os.getenv("FPL_TTL_EVENT_LIVE", "30"))
 # Simple in-memory cache with per-key expiry
 _cache: dict[str, tuple[float, Any]] = {}  # url -> (expires_at, data)
 
+# Team report endpoint cache (60-minute TTL)
+_report_cache: dict[str, tuple[float, Any]] = {}
+REPORT_CACHE_TTL = 3600  # 60 minutes
+
 
 def _cache_get(url: str) -> Any | None:
     item = _cache.get(url)
@@ -3530,6 +3534,573 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 # --------------------
+# REST API: Team Report Endpoint
+# --------------------
+
+
+async def team_report(request: Request) -> Response:
+    """GET /api/team-report/{team_id} — comprehensive team analysis JSON."""
+    raw_id = request.path_params.get("team_id", "")
+    try:
+        team_id = int(raw_id)
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "Invalid team_id — must be an integer"}, status_code=400)
+
+    if team_id <= 0:
+        return JSONResponse({"error": "team_id must be positive"}, status_code=400)
+
+    # Check report cache
+    cache_key = f"report:{team_id}"
+    cached = _report_cache.get(cache_key)
+    if cached:
+        expires_at, data = cached
+        if time.time() < expires_at:
+            return JSONResponse(data)
+        _report_cache.pop(cache_key, None)
+
+    # ---------- Fetch shared data ----------
+    try:
+        bs = await _bootstrap()
+    except Exception as e:
+        logger.error("Bootstrap fetch failed: %s", e)
+        return JSONResponse({"error": "Failed to fetch FPL data"}, status_code=502)
+
+    teams_by_id = {int(t["id"]): t for t in bs.get("teams", [])}
+    elements = bs.get("elements", [])
+    elements_by_id = {int(el["id"]): el for el in elements}
+    events = bs.get("events", [])
+    current_event = _current_event_id(events)
+
+    if current_event is None:
+        return JSONResponse({"error": "No current gameweek found"}, status_code=503)
+
+    next_event: int | None = None
+    for ev in events:
+        if ev.get("is_next"):
+            next_event = int(ev["id"])
+            break
+    if next_event is None:
+        next_event = current_event + 1
+
+    # Fetch manager data
+    try:
+        manager_info, manager_hist, picks, transfers = await asyncio.gather(
+            _manager_info(team_id),
+            _manager_history(team_id),
+            _manager_picks(team_id, current_event),
+            _manager_transfers(team_id),
+        )
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        if code == 404:
+            return JSONResponse({"error": f"Manager {team_id} not found"}, status_code=404)
+        return JSONResponse({"error": f"FPL API error: {code}"}, status_code=502)
+    except Exception as e:
+        logger.error("Manager data fetch failed: %s", e)
+        return JSONResponse({"error": "Failed to fetch manager data"}, status_code=502)
+
+    fixtures = await _fixtures()
+    team_strength = _calculate_team_strength(bs.get("teams", []))
+    fixture_horizon = 5
+    team_outlook = _team_fixture_outlook(fixtures, teams_by_id, current_event, horizon_gws=fixture_horizon)
+
+    # ====== META ======
+    meta = {
+        "currentGW": current_event,
+        "nextGW": next_event,
+        "analysisDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+    # ====== OVERVIEW ======
+    chips_history = manager_hist.get("chips", [])
+    chips_used = [{"name": c.get("name"), "event": c.get("event")} for c in chips_history]
+    all_chips = {"wildcard", "freehit", "bboost", "3xc"}
+    used_chip_names = {c.get("name") for c in chips_history}
+    wildcard_count = sum(1 for c in chips_history if c.get("name") == "wildcard")
+    chips_available: list[str] = []
+    for chip in sorted(all_chips):
+        if chip == "wildcard":
+            if wildcard_count < 2:
+                chips_available.append(chip)
+        elif chip not in used_chip_names:
+            chips_available.append(chip)
+
+    bank = round(_price_m(int(manager_info.get("last_deadline_bank", 0))), 1)
+    overview = {
+        "manager": f"{manager_info.get('player_first_name', '')} {manager_info.get('player_last_name', '')}".strip(),
+        "teamName": manager_info.get("name", ""),
+        "teamId": team_id,
+        "overallRank": manager_info.get("summary_overall_rank"),
+        "overallPoints": manager_info.get("summary_overall_points"),
+        "bank": bank,
+        "teamValue": round(_price_m(int(manager_info.get("last_deadline_value", 0))), 1),
+        "chipsUsed": chips_used,
+        "chipsAvailable": chips_available,
+    }
+
+    # ====== SQUAD (Starting XI + Bench) ======
+    squad_ids = [int(p["element"]) for p in picks.get("picks", [])]
+    starting_xi: list[dict[str, Any]] = []
+    bench_list: list[dict[str, Any]] = []
+    all_squad_data: list[dict[str, Any]] = []  # enriched player rows for reuse
+
+    for idx, pick in enumerate(picks.get("picks", [])):
+        el_id = int(pick["element"])
+        el = elements_by_id.get(el_id, {})
+        tid = int(el.get("team", 0))
+        pos = POS_MAP.get(int(el.get("element_type", 3)), "MID")
+
+        minutes = int(_to_float(el.get("minutes")))
+        games_played = max(1, minutes / 90.0)
+        avg_minutes = minutes / games_played if games_played > 1 else 90.0
+
+        xpts_data = _calculate_multi_gw_xpts(
+            el, fixtures, teams_by_id, current_event, fixture_horizon, avg_minutes, team_strength,
+        )
+
+        playing_prob = _playing_probability(el, avg_minutes)
+        if playing_prob < 0.5:
+            rotation_risk = "high"
+        elif playing_prob < 0.75:
+            rotation_risk = "medium"
+        else:
+            rotation_risk = "low"
+
+        # Next 3 fixtures for this player's team
+        team_fxs = team_outlook.get(tid, {}).get("next_opponents", [])[:3]
+        fixtures_next3 = [
+            {
+                "opponent": teams_by_id.get(fx.get("opponent_team"), {}).get("short_name", ""),
+                "difficulty": fx.get("difficulty"),
+                "is_home": fx.get("is_home"),
+            }
+            for fx in team_fxs
+        ]
+
+        xg = round(_to_float(el.get("expected_goals")), 2)
+        xa = round(_to_float(el.get("expected_assists")), 2)
+        xgi = round(_to_float(el.get("expected_goal_involvements")), 2)
+
+        player_row: dict[str, Any] = {
+            "name": el.get("web_name", str(el_id)),
+            "position": pos,
+            "team": teams_by_id.get(tid, {}).get("short_name", str(tid)),
+            "cost": round(_price_m(int(el.get("now_cost", 0))), 1),
+            "form": _to_float(el.get("form")),
+            "ppg": _to_float(el.get("points_per_game")),
+            "xG": xg,
+            "xA": xa,
+            "xGI": xgi,
+            "xP_next5": xpts_data["total_expected_points"],
+            "rotation_risk": rotation_risk,
+            "status": el.get("status", "a"),
+            "news": el.get("news", "") or "",
+            "fixtures_next3": fixtures_next3,
+        }
+
+        is_bench = idx >= 11  # picks 12-15 are bench
+
+        if not is_bench:
+            player_row["is_captain"] = pick.get("is_captain", False)
+            player_row["is_vice_captain"] = pick.get("is_vice_captain", False)
+            starting_xi.append(player_row)
+        else:
+            bench_list.append(player_row)
+
+        # Keep enriched copy for downstream sections
+        all_squad_data.append({
+            **player_row,
+            "id": el_id,
+            "_el": el,
+            "team_id": tid,
+            "is_bench": is_bench,
+            "playing_probability": playing_prob,
+            "avg_minutes": avg_minutes,
+        })
+
+    squad_section = {"startingXI": starting_xi, "bench": bench_list}
+
+    # ====== NEXT-GW FIXTURES ======
+    next_gw_fixtures: list[dict[str, Any]] = []
+    for fx in fixtures:
+        ev = fx.get("event")
+        if ev is None or int(ev) != next_event:
+            continue
+        h_id = fx.get("team_h")
+        a_id = fx.get("team_a")
+        if h_id is None or a_id is None:
+            continue
+        next_gw_fixtures.append({
+            "home": teams_by_id.get(int(h_id), {}).get("short_name", str(h_id)),
+            "away": teams_by_id.get(int(a_id), {}).get("short_name", str(a_id)),
+            "home_diff": int(_to_float(fx.get("team_h_difficulty", 0))),
+            "away_diff": int(_to_float(fx.get("team_a_difficulty", 0))),
+        })
+
+    # ====== FLAGGED PLAYERS ======
+    flagged_players: list[dict[str, Any]] = []
+    for pd in all_squad_data:
+        issues: list[str] = []
+        severity = "low"
+        el = pd["_el"]
+        status = str(el.get("status", "a"))
+        form_val = pd["form"]
+        p_prob = pd["playing_probability"]
+
+        # Injury / suspension / unavailable
+        if status in ("i", "s", "u"):
+            issues.append("injured/suspended/unavailable")
+            severity = "critical"
+        elif status == "d":
+            issues.append("doubtful")
+            severity = "moderate"
+
+        chance = el.get("chance_of_playing_next_round")
+        if chance is not None and _to_float(chance, 100) < 75:
+            pct = _to_float(chance, 100)
+            issues.append(f"chance of playing {int(pct)}%")
+            if pct <= 25:
+                severity = "critical"
+            elif severity != "critical":
+                severity = "moderate"
+
+        if 0 < form_val < 3.5:
+            issues.append(f"low form ({form_val})")
+            if severity == "low":
+                severity = "moderate" if form_val < 2.0 else "low"
+
+        if pd["rotation_risk"] == "high":
+            issues.append("high rotation risk")
+            if severity == "low":
+                severity = "moderate"
+
+        fxs = pd["fixtures_next3"]
+        if fxs:
+            avg_fdr = sum(f.get("difficulty", 3) for f in fxs) / len(fxs)
+            if avg_fdr > 3.5:
+                issues.append(f"tough fixtures (avg FDR {avg_fdr:.1f})")
+
+        avg_m = pd["avg_minutes"]
+        if avg_m < 60 and int(_to_float(el.get("minutes"))) > 0:
+            issues.append(f"low avg minutes ({avg_m:.0f})")
+            if severity == "low":
+                severity = "moderate"
+
+        if issues:
+            flagged_players.append({
+                "name": pd["name"],
+                "position": pd["position"],
+                "team": pd["team"],
+                "cost": pd["cost"],
+                "form": form_val,
+                "severity": severity,
+                "issues": issues,
+                "bench": pd["is_bench"],
+            })
+
+    severity_order = {"critical": 0, "moderate": 1, "low": 2}
+    flagged_players.sort(key=lambda x: severity_order.get(x["severity"], 3))
+
+    # ====== TRANSFER RECOMMENDATIONS ======
+    current_squad_ids = set(squad_ids)
+
+    # Score every squad player once via first-pass model
+    squad_scored: list[dict[str, Any]] = []
+    for pd in all_squad_data:
+        scored = _score_player_first_pass(
+            pd["_el"], teams_by_id, fixtures, fixture_horizon,
+            current_event, team_strength=team_strength, elements=elements,
+        )
+        scored["_pd"] = pd
+        squad_scored.append(scored)
+    squad_scored.sort(key=lambda x: x["expected_points"])  # weakest first
+
+    transfer_recs: list[dict[str, Any]] = []
+    for out_scored in squad_scored[:8]:  # check weakest 8
+        out_el = elements_by_id.get(out_scored["id"], {})
+        pos = out_scored["position"]
+        sell_price = out_scored["price_m"]
+        out_pd = out_scored["_pd"]
+
+        # Issues carried from flagged
+        out_issues = next(
+            (fp["issues"] for fp in flagged_players if fp["name"] == out_pd["name"]),
+            [],
+        )
+        out_fxs = out_pd["fixtures_next3"]
+        out_avg_fdr = round(sum(f.get("difficulty", 3) for f in out_fxs) / len(out_fxs), 1) if out_fxs else 0.0
+
+        # Find valid replacements
+        candidates: list[dict[str, Any]] = []
+        for el in elements:
+            in_id = int(el["id"])
+            if in_id in current_squad_ids:
+                continue
+            if POS_MAP.get(int(el.get("element_type", 3)), "MID") != pos:
+                continue
+            if str(el.get("status", "a")) != "a":
+                continue
+
+            tc = _can_transfer_in(
+                player_in=el, player_out=out_el,
+                current_squad_ids=current_squad_ids,
+                elements_by_id=elements_by_id,
+                bank=bank, selling_price=sell_price,
+            )
+            if not tc["valid"]:
+                continue
+
+            scored_in = _score_player_first_pass(
+                el, teams_by_id, fixtures, fixture_horizon,
+                current_event, team_strength=team_strength, elements=elements,
+            )
+            gain = scored_in["expected_points"] - out_scored["expected_points"]
+            if gain <= 0:
+                continue
+
+            in_tid = int(el.get("team", 0))
+            in_fxs_raw = team_outlook.get(in_tid, {}).get("next_opponents", [])[:3]
+            in_fxs = [
+                {
+                    "opponent": teams_by_id.get(f.get("opponent_team"), {}).get("short_name", ""),
+                    "difficulty": f.get("difficulty"),
+                    "is_home": f.get("is_home"),
+                }
+                for f in in_fxs_raw
+            ]
+            in_avg_fdr = round(sum(f.get("difficulty", 3) for f in in_fxs) / len(in_fxs), 1) if in_fxs else 0.0
+
+            candidates.append({
+                "name": scored_in["name"],
+                "team": scored_in["team"],
+                "position": pos,
+                "cost": scored_in["price_m"],
+                "form": scored_in["signals"]["form"],
+                "xP_next5": scored_in["expected_points"],
+                "transfer_score": round(gain, 2),
+                "fixtures_next3": in_fxs,
+                "avg_fdr": in_avg_fdr,
+            })
+
+        candidates.sort(key=lambda x: x["transfer_score"], reverse=True)
+        if not candidates:
+            continue
+
+        transfer_recs.append({
+            "out": {
+                "name": out_pd["name"],
+                "team": out_pd["team"],
+                "position": pos,
+                "cost": out_pd["cost"],
+                "form": out_pd["form"],
+                "xP_next5": out_scored["expected_points"],
+                "issues": out_issues,
+                "avg_fdr": out_avg_fdr,
+                "fixtures_next3": out_pd["fixtures_next3"],
+            },
+            "in": candidates[0],
+            "alternatives": candidates[1:4],
+            "cost_change": round(candidates[0]["cost"] - out_pd["cost"], 1),
+            "is_free": False,  # set after sort
+        })
+
+    transfer_recs.sort(key=lambda x: x["in"]["transfer_score"], reverse=True)
+    transfer_recs = transfer_recs[:5]
+    for i, rec in enumerate(transfer_recs):
+        rec["is_free"] = i == 0  # first suggestion is the free transfer
+
+    # ====== CAPTAINCY PICKS (squad players only) ======
+    event_fixtures_map: dict[int, list[dict[str, Any]]] = {}
+    for fx in fixtures:
+        ev = fx.get("event")
+        if ev is None or int(ev) != next_event:
+            continue
+        for team_key, opp_key, diff_key, is_home in [
+            ("team_h", "team_a", "team_h_difficulty", True),
+            ("team_a", "team_h", "team_a_difficulty", False),
+        ]:
+            tid = fx.get(team_key)
+            if tid is None:
+                continue
+            tid = int(tid)
+            event_fixtures_map.setdefault(tid, []).append({
+                "opponent": fx.get(opp_key),
+                "difficulty": int(_to_float(fx.get(diff_key))),
+                "is_home": is_home,
+            })
+
+    captaincy_picks: list[dict[str, Any]] = []
+    for pd in all_squad_data:
+        if pd["is_bench"]:
+            continue
+        el = pd["_el"]
+        tid = pd["team_id"]
+        team_fx = event_fixtures_map.get(tid, [])
+        if not team_fx:
+            continue
+
+        ppg = _to_float(el.get("points_per_game"))
+        form_val = _to_float(el.get("form"))
+        ict = _to_float(el.get("ict_index"))
+        threat = _to_float(el.get("threat"))
+
+        home_bonus = 0.5 if any(f["is_home"] for f in team_fx) else 0.0
+        avg_diff = sum(f["difficulty"] for f in team_fx) / len(team_fx)
+        fixture_ease = 6.0 - avg_diff
+        dgw_mult = len(team_fx)
+        penalty_bonus = 1.5 if _to_float(el.get("penalties_order", 99)) <= 2 else 0.0
+
+        cap_score = (
+            (form_val * 2.0) + (ppg * 1.5) + (threat * 0.01) + (ict * 0.05)
+            + (fixture_ease * 1.2) + home_bonus + penalty_bonus
+        ) * dgw_mult
+
+        nfx = team_fx[0]
+        opp_id = nfx.get("opponent")
+        opp_short = teams_by_id.get(int(opp_id), {}).get("short_name", "") if opp_id else ""
+
+        captaincy_picks.append({
+            "name": pd["name"],
+            "team": pd["team"],
+            "form": form_val,
+            "xP_next5": pd["xP_next5"],
+            "captaincy_score": round(cap_score, 2),
+            "next_fixture": f"{'vs' if nfx.get('is_home') else '@'} {opp_short}",
+            "next_fdr": nfx.get("difficulty", 0),
+        })
+
+    captaincy_picks.sort(key=lambda x: x["captaincy_score"], reverse=True)
+    captaincy_picks = captaincy_picks[:5]
+
+    # ====== BGW / DGW OUTLOOK ======
+    ev_start = current_event
+    ev_end = current_event + 5
+    team_fixture_count: dict[int, dict[int, int]] = {}
+    for fx in fixtures:
+        ev = fx.get("event")
+        if ev is None:
+            continue
+        ev = int(ev)
+        if ev < ev_start or ev > ev_end:
+            continue
+        for tk in ("team_h", "team_a"):
+            tid = fx.get(tk)
+            if tid is None:
+                continue
+            tid = int(tid)
+            team_fixture_count.setdefault(tid, {})
+            team_fixture_count[tid][ev] = team_fixture_count[tid].get(ev, 0) + 1
+
+    all_team_ids = set(teams_by_id.keys())
+    bgw_dgw_outlook: list[dict[str, Any]] = []
+    for ev in range(ev_start, ev_end + 1):
+        teams_with = {tid for tid, ec in team_fixture_count.items() if ev in ec}
+        blanking = sorted(
+            teams_by_id.get(tid, {}).get("short_name", str(tid))
+            for tid in (all_team_ids - teams_with)
+        )
+        doubling = sorted(
+            teams_by_id.get(tid, {}).get("short_name", str(tid))
+            for tid, ec in team_fixture_count.items()
+            if ev in ec and ec[ev] >= 2
+        )
+        if blanking or doubling:
+            bgw_dgw_outlook.append({"gw": ev, "blanking": blanking, "doubling": doubling})
+
+    # ====== BGW EXPOSURE (squad players affected) ======
+    bgw_exposure: list[dict[str, Any]] = []
+    for ev in range(ev_start, ev_end + 1):
+        teams_with = {tid for tid, ec in team_fixture_count.items() if ev in ec}
+        blanking_tids = all_team_ids - teams_with
+        if not blanking_tids:
+            continue
+        affected = [pd["name"] for pd in all_squad_data if pd["team_id"] in blanking_tids]
+        if affected:
+            bgw_exposure.append({
+                "gw": ev,
+                "blanking_teams": sorted(
+                    teams_by_id.get(tid, {}).get("short_name", str(tid)) for tid in blanking_tids
+                ),
+                "affected_players": affected,
+                "total_affected": len(affected),
+            })
+
+    # ====== BEST FIXTURE TEAMS ======
+    best_fixture_teams: list[dict[str, Any]] = []
+    for tid, ol in team_outlook.items():
+        fxs = ol.get("next_opponents", [])[:5]
+        best_fixture_teams.append({
+            "team": teams_by_id.get(tid, {}).get("short_name", str(tid)),
+            "avgFDR": round(ol.get("avg_difficulty", 5.0), 2),
+            "fixtures": [
+                {
+                    "opponent": teams_by_id.get(f.get("opponent_team"), {}).get("short_name", ""),
+                    "difficulty": f.get("difficulty"),
+                    "is_home": f.get("is_home"),
+                    "event": f.get("event"),
+                }
+                for f in fxs
+            ],
+        })
+    best_fixture_teams.sort(key=lambda x: x["avgFDR"])
+    best_fixture_teams = best_fixture_teams[:10]
+
+    # ====== GW HISTORY (last 5) ======
+    gw_history: list[dict[str, Any]] = []
+    for gw in (manager_hist.get("current", []) or [])[-5:]:
+        gw_history.append({
+            "event": gw.get("event"),
+            "points": gw.get("points"),
+            "rank": gw.get("overall_rank"),
+            "bench_points": gw.get("points_on_bench"),
+            "transfers": gw.get("event_transfers"),
+            "transfers_cost": gw.get("event_transfers_cost"),
+        })
+
+    # ====== RECENT TRANSFERS (last 5) ======
+    raw_transfers = transfers[-5:] if isinstance(transfers, list) else []
+    recent_transfers: list[dict[str, Any]] = []
+    for t in reversed(raw_transfers):
+        in_el = elements_by_id.get(int(t.get("element_in", 0)), {})
+        out_el_t = elements_by_id.get(int(t.get("element_out", 0)), {})
+        recent_transfers.append({
+            "event": t.get("event"),
+            "player_in": in_el.get("web_name", str(t.get("element_in"))),
+            "player_out": out_el_t.get("web_name", str(t.get("element_out"))),
+            "cost_in": round(_price_m(int(t.get("element_in_cost", 0))), 1),
+            "cost_out": round(_price_m(int(t.get("element_out_cost", 0))), 1),
+        })
+
+    # ====== BUDGET SUMMARY ======
+    budget_summary = {
+        "current_bank": bank,
+        "team_value": overview["teamValue"],
+        "bank_after_transfers": round(bank, 1),
+    }
+
+    # ---------- Assemble response ----------
+    response: dict[str, Any] = {
+        "meta": meta,
+        "overview": overview,
+        "squad": squad_section,
+        "nextGWFixtures": next_gw_fixtures,
+        "flaggedPlayers": flagged_players,
+        "transferRecommendations": transfer_recs,
+        "captaincyPicks": captaincy_picks,
+        "bgwDgwOutlook": bgw_dgw_outlook,
+        "bgwExposure": bgw_exposure,
+        "bestFixtureTeams": best_fixture_teams,
+        "gwHistory": gw_history,
+        "recentTransfers": recent_transfers,
+        "budgetSummary": budget_summary,
+    }
+
+    # Cache for 60 minutes
+    _report_cache[cache_key] = (time.time() + REPORT_CACHE_TTL, response)
+    return JSONResponse(response)
+
+
+# --------------------
 # SSE Transport + Starlette wiring
 # --------------------
 sse = SseServerTransport("/messages/")
@@ -3553,6 +4124,7 @@ starlette_app = Starlette(
     debug=os.getenv("DEBUG", "0") == "1",
     routes=[
         Route("/health", health, methods=["GET"]),
+        Route("/api/team-report/{team_id}", team_report, methods=["GET"]),
         Route("/sse", handle_sse, methods=["GET"]),
         Mount("/messages/", app=sse.handle_post_message),
     ],
